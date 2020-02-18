@@ -3,7 +3,7 @@ from absl.flags import FLAGS
 import os
 import datetime
 import tensorflow as tf
-from tensorflow.keras.callbacks import ModelCheckpoint, TensorBoard
+from tensorflow.keras.callbacks import ModelCheckpoint, TensorBoard, TerminateOnNaN
 
 from modules.models import ArcFaceModel
 from modules.losses import SoftmaxLoss
@@ -84,11 +84,19 @@ def main(_):
                 reg_loss = tf.reduce_sum(model.losses)
                 pred_loss = loss_fn(labels, logist)
                 total_loss = pred_loss + reg_loss
-
+            
             grads = tape.gradient(total_loss, model.trainable_variables)
             optimizer.apply_gradients(zip(grads, model.trainable_variables))
+            
+            if tf.math.is_nan(total_loss):
+                logging.info('Error! Loss is NaN')
+                break
 
-            if steps % 5 == 0:
+            if steps % cfg['save_steps'] == 0:
+                logging.info('[*] save ckpt file!')
+                model.save_weights('checkpoints/{}/e_{}_b_{}.ckpt'.format(
+                    cfg['sub_name'], epochs, steps % steps_per_epoch))
+                
                 verb_str = "Epoch {}/{}: {}/{}, loss={:.2f}, lr={:.4f}"
                 logging.info(verb_str.format(epochs, cfg['epochs'],
                                       steps % steps_per_epoch,
@@ -105,14 +113,15 @@ def main(_):
                         'loss/reg loss', reg_loss, step=steps)
                     tf.summary.scalar(
                         'learning rate', optimizer.lr, step=steps)
-
-            if steps % cfg['save_steps'] == 0:
-                logging.info('[*] save ckpt file!')
+            
+            steps += 1
+            next_epochs = steps // steps_per_epoch + 1
+            if next_epochs > epochs or next_epochs > cfg['epochs']:
+                logging.info('[*] save ckpt file for each epochs!')
                 model.save_weights('checkpoints/{}/e_{}_b_{}.ckpt'.format(
                     cfg['sub_name'], epochs, steps % steps_per_epoch))
-
-            steps += 1
-            epochs = steps // steps_per_epoch + 1
+            
+            epochs = next_epochs
     else:
         model.compile(optimizer=optimizer, loss=loss_fn,
                       run_eagerly=(FLAGS.mode == 'eager_fit'))
@@ -128,7 +137,11 @@ def main(_):
                                   profile_batch=0)
         tb_callback._total_batches_seen = steps
         tb_callback._samples_seen = steps * cfg['batch_size']
-        callbacks = [mc_callback, tb_callback]
+        
+        # Stop when NaN loss is detected
+        nan_callback = TerminateOnNaN()
+        
+        callbacks = [mc_callback, tb_callback, nan_callback]
 
         history = model.fit(train_dataset,
                             epochs=cfg['epochs'],

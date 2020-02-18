@@ -1,0 +1,9 @@
+*.data-00000-of-00002
+*.data-00001-of-00002
+*.index
+data/faces_test/
+*.v2
+modules/__pycache__/
+*.zip
+*.tfrecord
+checkpoints/arc_res50/checkpoint
