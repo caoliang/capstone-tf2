@@ -7,3 +7,4 @@ modules/__pycache__/
 *.zip
 *.tfrecord
 checkpoints/arc_res50/checkpoint
+models/pre-train/arc_res50_ccrop/
