@@ -65,6 +65,9 @@ def detect_faces_features(image = None, mtcnn_nets = None,
     if image is None or not hasattr(image, "shape"):
         raise Exception("Face image is invalid")
     
+    if mtcnn_nets is None:
+        raise Exception("Cannot get mtcnn nets")
+        
     height, width, _ = image.shape
     logger.info("image.shape {0}".format(image.shape))
     stage_status = StageStatus(width=width, height=height)
@@ -75,9 +78,6 @@ def detect_faces_features(image = None, mtcnn_nets = None,
     scales = compute_scale_pyramid(m, min_layer, scale_factor)
     
     stages = [__stage1, __stage2, __stage3]
-    if mtcnn_nets is None:
-        # pnet, rnet, onet = mtcnn_nets
-        mtcnn_nets = create_mtcnn_nets()
     
     result = [scales, stage_status]
     
@@ -294,13 +294,13 @@ def __stage1(img, step_threshold, mtcnn_net, scales, stage_status):
         img_x = np.expand_dims(scaled_image, 0)
         img_y = np.transpose(img_x, (0, 2, 1, 3))
     
-        out = mtcnn_net.predict(img_y)
+        p_classifier, p_bbox_regress = mtcnn_net.predict(img_y)
     
-        out0 = np.transpose(out[0], (0, 2, 1, 3))
-        out1 = np.transpose(out[1], (0, 2, 1, 3))
+        p_bbox_regress = np.transpose(p_bbox_regress, (0, 2, 1, 3))
+        p_classifier = np.transpose(p_classifier, (0, 2, 1, 3))
     
-        boxes, _ = __generate_bounding_box(out1[0, :, :, 1].copy(),
-                                           out0[0, :, :, :].copy(), 
+        boxes, _ = __generate_bounding_box(p_classifier[0, :, :, 1].copy(),
+                                           p_bbox_regress[0, :, :, :].copy(), 
                                            scale, step_threshold)
     
         # inter-scale nms
@@ -374,19 +374,19 @@ def __stage2(img, step_threshold, mtcnn_net, total_boxes, stage_status):
     tempimg = (tempimg - 127.5) * 0.0078125
     tempimg1 = np.transpose(tempimg, (3, 1, 0, 2))
 
-    out = mtcnn_net.predict(tempimg1)
+    r_classifier, r_bbox_regress = mtcnn_net.predict(tempimg1)
 
-    out0 = np.transpose(out[0])
-    out1 = np.transpose(out[1])
+    r_bbox_regress = np.transpose(r_bbox_regress)
+    r_classifier = np.transpose(r_classifier)
 
-    score = out1[1, :]
+    score = r_classifier[1, :]
 
     ipass = np.where(score > step_threshold)
 
     total_boxes = np.hstack([total_boxes[ipass[0], 0:4].copy(), 
                              np.expand_dims(score[ipass].copy(), 1)])
 
-    mv = out0[:, ipass[0]]
+    mv = r_bbox_regress[:, ipass[0]]
 
     if total_boxes.shape[0] > 0:
         pick = __nms(total_boxes, 0.7, 'Union')
@@ -433,14 +433,14 @@ def __stage3(img, step_threshold, mtcnn_net, total_boxes, stage_status):
     tempimg = (tempimg - 127.5) * 0.0078125
     tempimg1 = np.transpose(tempimg, (3, 1, 0, 2))
 
-    out = mtcnn_net.predict(tempimg1)
-    out0 = np.transpose(out[0])
-    out1 = np.transpose(out[1])
-    out2 = np.transpose(out[2])
+    o_classifier, o_bbox_regress, o_landmark_regress = mtcnn_net.predict(tempimg1)
+    o_bbox_regress = np.transpose(o_bbox_regress)
+    o_landmark_regress = np.transpose(o_landmark_regress)
+    o_classifier = np.transpose(o_classifier)
 
-    score = out2[1, :]
+    score = o_classifier[1, :]
 
-    points = out1
+    points = o_landmark_regress
 
     ipass = np.where(score > step_threshold)
 
@@ -449,7 +449,7 @@ def __stage3(img, step_threshold, mtcnn_net, total_boxes, stage_status):
     total_boxes = np.hstack([total_boxes[ipass[0], 0:4].copy(), 
                              np.expand_dims(score[ipass].copy(), 1)])
 
-    mv = out0[:, ipass[0]]
+    mv = o_bbox_regress[:, ipass[0]]
 
     w = total_boxes[:, 2] - total_boxes[:, 0] + 1
     h = total_boxes[:, 3] - total_boxes[:, 1] + 1

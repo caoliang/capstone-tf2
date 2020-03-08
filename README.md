@@ -6,19 +6,19 @@
 conda activate capstone-tf2
 
 2. Install jupyter
-
 > conda install -c anaconda jupyter
 
 3. Install spyder
 > conda install -c anaconda spyder=3.3.6
 
 4. Install yaml
-
 > pip install pyyaml==5.2
 
 5. Install imageio
-
 > conda install -c conda-forge imageio
+
+6. In case spyder failed to start, install pyside2
+> conda install -c anaconda pyside2
 
 
 ## Files
