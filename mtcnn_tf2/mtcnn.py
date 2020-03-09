@@ -3,7 +3,7 @@ import os
 
 import tensorflow as tf
 import numpy as np
-from tensorflow.keras.layers import Conv2D, Input, MaxPool2D
+from tensorflow.keras.layers import Conv2D, Input, MaxPool2D, Lambda
 from tensorflow.keras.layers import Flatten, Reshape
 from tensorflow.keras.layers import Dense, Permute, Softmax, PReLU
 from tensorflow.keras.models import Model
@@ -44,8 +44,12 @@ class NetWork(object):
 
 class PNet(NetWork):
 
-    def create_pnet(self, input_shape=(12, 12, 3), network_mode='train'):
-        p_inp = Input(input_shape)
+    def create_pnet(self, input_shape=(12, 12, 3), train_input=None,
+                    network_mode='train'):
+        if network_mode == 'train':
+            p_inp = Lambda(data_input)(train_input)
+        else:
+            p_inp = Input(input_shape)
     
         p_layer = Conv2D(10, kernel_size=(3, 3), strides=(1, 1), 
                          padding="valid", name='conv1')(p_inp)
@@ -113,17 +117,91 @@ def read_and_decode(serialized_data, label_type, shape):
     return image, label
 
 
-def inputs(tfrecords_filename, batch_size, num_epochs, label_type, shape):
-    capacity=1000 + 3 * batch_size
+def data_input(net_input):
+    random_int = tf.random_uniform([1])
+    if len(net_input) == 2:
+        condition = random_int[0] > tf.constant(0.5)
+        val = tf.case({condition: lambda: net_input[0]},
+                      default=lambda: net_input[1])
+    elif len(net_input) == 3:
+        condition1 = random_int[0] > tf.constant(0.4)
+        condition2 = random_int[0] > tf.constant(0.9)
+        
+        val = tf.case({condition1: lambda: net_input[0],
+                       condition2: lambda: net_input[1],
+                       },
+                       default=lambda: net_input[2])
+    else:
+        raise Exception(f'Invalid net_input size: {len(net_input)}')
+    
+    val.set_shape(net_input[0].shape)
+    return [val,random_int]# tuple (output,random_int ) is NOT allowed
+
+def prepare_train_inputs(tfrecords_filename, batch_size, num_epochs, label_type, shape):
+    #capacity=1000 + 3 * batch_size
     
     images, labels = tf.data.TFRecordDataset(tfrecords_filename) \
-                    .shuffle(capacity) \
-                    .batch(batch_size) \
-                    .repeat(num_epochs) \
                     .map(lambda x: read_and_decode(x, label_type, shape))
-
+                    #.shuffle(capacity) \
+                    #.batch(batch_size) \
+                    #.repeat(num_epochs) \
+                    
     return images, labels
 
+def mtcnn_loss(net_type): # need to make sure input type
+    random_int = tf.random_uniform([1])
+    
+    if print_progress: random_int = tf.Print(random_int[0], ['random in cls',random_int])
+    condition1 = random_int[0] > tf.constant(0.5)
+    
+    if type =='cls':
+        def lossfun(y_true, y_pred):
+            if print_progress: condition = tf.Print(condition1, ['rand int[0]:', random_int[0],
+                                                    ' tf.constant:', tf.constant(rand_threshold[1]),
+                                                    ' condition1:', condition1 ])
+            val= tf.case({ condition1: lambda: K.mean(K.square(y_pred - y_true), axis=-1),
+                           condition0: lambda: 0 * K.mean(K.square(y_true), axis=-1)
+                           },
+                         default=lambda:0 * K.mean(K.square(y_true), axis=-1),
+                         exclusive=False )
+
+            if print_progress: val = tf.Print(val, ['cls loss out:',val,
+                                                    ' rand int received:',random_int,
+                                                    'condition',condition1])
+            val.set_shape(K.mean(K.square(y_true), axis=-1).shape)
+            return val
+    elif type =='roi':
+        def lossfun(y_true, y_pred):
+            if print_progress: condition = tf.Print(condition1, ['rand int[0]:', random_int[0],
+                                                                ' tf.constant:', tf.constant(rand_threshold),
+                                                                ' condition:', condition1])
+            val= tf.case({ condition1: lambda: 0 * K.mean(K.square(y_true), axis=-1),
+                           condition0: lambda: K.mean(K.square(y_pred - y_true), axis=-1)
+                         },
+                         default=lambda: 0 * K.mean(K.square(y_true), axis=-1),exclusive=False)
+            if print_progress: val = tf.Print(val, ['roi loss out :', val,
+                                                    ' rand int received:', random_int,
+                                                    'condition', condition1])
+            val.set_shape(K.mean(K.square(y_true), axis=-1).shape)
+            return val
+    else :
+        def lossfun(y_true, y_pred):
+            if print_progress: condition = tf.Print(condition1, ['rand int[0]:', random_int[0],
+                                                                 ' tf.constant:', tf.constant(rand_threshold),
+                                                                 ' condition:', condition1])
+            val = tf.case({condition1: lambda: 0 * K.mean(K.square(y_true), axis=-1),
+                           condition0: lambda: 0 * K.mean(K.square(y_true), axis=-1)
+                           },
+                          default=lambda: K.mean(K.square(y_pred - y_true), axis=-1),exclusive=False)
+            val.set_shape(K.mean(K.square(y_true), axis=-1).shape)
+            if print_progress: val = tf.Print(val, ['pts loss out :', val,
+                                                    ' rand int received:', random_int,
+                                                    'condition', condition1])
+            return val
+    return lossfun
+
+def accuracy (y_pred,y_true):
+    return K.mean(y_true)
 
 def train_net(Net, training_data, base_lr, loss_weight,
               train_mode, num_epochs=[1, None, None],
@@ -134,35 +212,37 @@ def train_net(Net, training_data, base_lr, loss_weight,
     images = []
     labels = []
     tasks = ['cls', 'bbx', 'pts']
-    shape = 12
     if Net.__name == 'PNet':
-        shape = 12
-        train_mode = 2
+        shape_size = 12
+        train_input = [Input(shape=[shape_size, shape_size, 3]),
+                       Input(shape=[shape_size, shape_size, 3])]
+                       
     elif Net.__name__ == 'RNet':
-        shape = 24
-        train_mode = 2
+        shape_size = 24
+        train_input = [Input(shape=[shape_size, shape_size, 3]),
+                       Input(shape=[shape_size, shape_size, 3])]
     elif Net.__name__ == 'ONet':
-        shape = 48
-        train_mode = 3
+        shape_size = 48
+        train_input = [Input(shape=[shape_size, shape_size, 3]),
+                       Input(shape=[shape_size, shape_size, 3]),
+                       Input(shape=[shape_size, shape_size, 3])]
     else:
         raise Exception('Invalid training net model')
     
+    input, random_int = Lambda(data_input)(train_input)
+    
     for index in range(train_mode):
-        image, label = inputs(filename=[training_data[index]],
+        image, label = prepare_train_inputs(filename=[training_data[index]],
                               batch_size=batch_size,
                               num_epochs=num_epochs[index],
                               label_type=tasks[index],
-                              shape=shape)
+                              shape=shape_size)
         images.append(image)
         labels.append(label)
     
     
-    if train_mode == 2:
-        net = Net((('cls', images[0]), ('bbx', images[1])))
-    elif train_mode == 3:
-        net = Net((('cls', images[0]), ('bbx', images[1]), ('pts', images[2])))
-    else:
-        raise Exception(f'Invalid train_mode {train_mode}')
+    net = Net((images)
+    my_adam = adam(lr = 0.00001)
 
     out_put = net.get_all_output()
     cls_output = tf.reshape(out_put[0], [-1, 2])
