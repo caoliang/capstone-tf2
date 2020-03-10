@@ -1,55 +1,74 @@
 """Main script. Contain model definition and training code."""
 import os
-
+import gc
 import tensorflow as tf
 import numpy as np
 from tensorflow.keras.layers import Conv2D, Input, MaxPool2D, Lambda
 from tensorflow.keras.layers import Flatten, Reshape
 from tensorflow.keras.layers import Dense, Permute, Softmax, PReLU
 from tensorflow.keras.models import Model
+from tensorflow.keras import backend
+from tensorflow.keras.optimizers import Adam
 
 
 class NetWork(object):
 
-    def __init__(self, inputs, mode='train'):
+    def __init__(self, mode='data', rnd_thresholds=None, weights_path=None):
 
-        self.inputs = inputs
         self.mode = mode
-        self.out_put = []
-        # Default model which is also current training model
-        self.net_model = None
-        # Current training task index
-        self.cur_task_index = -1
+        self.rnd_thresholds = rnd_thresholds
+        self.weights_path = weights_path
+        
+        # Network model
+        self.net_model = self.setup()
+        # Load weights if available
+        self.load()
 
-        if self.mode == 'train':
-            self.tasks = [inp[0] for inp in inputs]
-            self.net_model = self.setup(self.mode)
-            self.cur_task_index = 0
-        else:
-            self.net_model = self.setup(self.mode)
-
-    def setup(self, task='data'):
+    def setup(self):
         raise NotImplementedError('Must be implemented by the subclass.')
 
-    def load(self, weights_path):
-        if os.path.exists(weights_path):
-            self.net_model.load_weights_file(weights_path, by_name=True)
+    def load(self):
+        if os.path.exists(self.weights_path):
+            self.net_model.load_weights_file(self.weights_path, by_name=True)
 
-    def get_all_output(self):
-        return self.out_put
+    def get_net_model(self):
+        return self.net_model
 
-    def validate_padding(self, padding):
-        assert padding in ('SAME', 'VALID')
-
+    def get_data_input(self, net_inputs, thresholds=None):
+        random_int = tf.random_uniform([1])
+        net_inputs_len = len(net_inputs)
+        if net_inputs_len == 2:
+            if thresholds is None: thresholds = [0.5]
+            
+            condition = random_int[0] > tf.constant(thresholds[0])
+            val = tf.case({condition: lambda: net_inputs[0]},
+                          default=lambda: net_inputs[1])
+        elif net_inputs_len == 3:
+            if thresholds is None: thresholds = [0.4, 0.9]
+            
+            condition0 = random_int[0] > tf.constant(thresholds[0])
+            condition1 = random_int[0] > tf.constant(thresholds[1])
+            
+            val = tf.case({condition1: lambda: net_inputs[1],
+                           condition0: lambda: net_inputs[2],
+                           },
+                           default=lambda: net_inputs[2],
+                           exclusive = False)
+        else:
+            raise Exception(f'Invalid net_inputs size: {len(net_inputs)}')
+        
+        val.set_shape(net_inputs[0].shape)
+        return [val,random_int]# tuple (output,random_int ) is NOT allowed
 
 class PNet(NetWork):
 
-    def create_pnet(self, input_shape=(12, 12, 3), train_input=None,
-                    network_mode='train'):
-        if network_mode == 'train':
-            p_inp = Lambda(data_input)(train_input)
+    def create_pnet(self):
+        if self.mode == 'data':
+            p_inp = Input(shape = [12, 12, 3])
         else:
-            p_inp = Input(input_shape)
+            train_inputs = [Input(shape = [12, 12, 3]),
+                            Input(shape = [12, 12, 3])]
+            p_inp = Lambda(self.get_data_input)(train_inputs)
     
         p_layer = Conv2D(10, kernel_size=(3, 3), strides=(1, 1), 
                          padding="valid", name='conv1')(p_inp)
@@ -65,15 +84,7 @@ class PNet(NetWork):
                          padding="valid", name='conv3')(p_layer)
         p_layer = PReLU(shared_axes=[1, 2], name='PReLU3')(p_layer)
     
-        if network_mode == 'train':
-            p_classifier = Conv2D(2, kernel_size=(1, 1), strides=(1, 1), 
-                              activation='softmax', name='cls1')(p_layer)
-            p_classifier = Reshape((2,))(p_classifier)
-            p_bbox_regress = Conv2D(4, kernel_size=(1, 1), strides=(1, 1), 
-                              name='bbox1')(p_layer)
-            p_bbox_regress = Reshape((4,))(p_bbox_regress)
-            p_net = Model([p_inp], [p_classifier, p_bbox_regress])
-        else:
+        if self.mode == 'data':
             p_classifier = Conv2D(2, kernel_size=(1, 1), strides=(1, 1), 
                                   activation='softmax', name='cls1')(p_layer)
             p_classifier = Reshape((2,))(p_classifier)
@@ -83,11 +94,19 @@ class PNet(NetWork):
             p_bbox_regress = Reshape((4,))(p_bbox_regress)
         
             p_net = Model([p_inp], [p_classifier, p_bbox_regress])
+        else:
+            p_classifier = Conv2D(2, kernel_size=(1, 1), strides=(1, 1), 
+                              activation='softmax', name='cls1')(p_layer)
+            p_classifier = Reshape((2,))(p_classifier)
+            p_bbox_regress = Conv2D(4, kernel_size=(1, 1), strides=(1, 1), 
+                              name='bbox1')(p_layer)
+            p_bbox_regress = Reshape((4,))(p_bbox_regress)
+            p_net = Model([p_inp], [p_classifier, p_bbox_regress])
        
         return p_net
     
-    def setup(self, network_mode='train'):
-        return self.create_pnet(network_mode=network_mode)
+    def setup(self):
+        return self.create_pnet()
 
 
 def read_and_decode(serialized_data, label_type, shape):
@@ -117,27 +136,8 @@ def read_and_decode(serialized_data, label_type, shape):
     return image, label
 
 
-def data_input(net_input):
-    random_int = tf.random_uniform([1])
-    if len(net_input) == 2:
-        condition = random_int[0] > tf.constant(0.5)
-        val = tf.case({condition: lambda: net_input[0]},
-                      default=lambda: net_input[1])
-    elif len(net_input) == 3:
-        condition1 = random_int[0] > tf.constant(0.4)
-        condition2 = random_int[0] > tf.constant(0.9)
-        
-        val = tf.case({condition1: lambda: net_input[0],
-                       condition2: lambda: net_input[1],
-                       },
-                       default=lambda: net_input[2])
-    else:
-        raise Exception(f'Invalid net_input size: {len(net_input)}')
-    
-    val.set_shape(net_input[0].shape)
-    return [val,random_int]# tuple (output,random_int ) is NOT allowed
-
-def prepare_train_inputs(tfrecords_filename, batch_size, num_epochs, label_type, shape):
+def prepare_train_inputs(tfrecords_filename, batch_size, 
+                         num_epochs, label_type, shape):
     #capacity=1000 + 3 * batch_size
     
     images, labels = tf.data.TFRecordDataset(tfrecords_filename) \
@@ -148,205 +148,202 @@ def prepare_train_inputs(tfrecords_filename, batch_size, num_epochs, label_type,
                     
     return images, labels
 
-def mtcnn_loss(net_type): # need to make sure input type
+def mtcnn_loss(net_type, train_tasks=2, rand_threshold=[0.5]): # need to make sure input type
     random_int = tf.random_uniform([1])
     
-    if print_progress: random_int = tf.Print(random_int[0], ['random in cls',random_int])
-    condition1 = random_int[0] > tf.constant(0.5)
+    print_progress = False
     
-    if type =='cls':
+    if print_progress: 
+        random_int = tf.Print(random_int[0], ['random in cls',random_int])
+    if train_tasks == 2:
+        condition0 = random_int[0] > tf.constant(rand_threshold[0])
+        condition1 = not condition0
+    else:
+        condition0 = random_int[0] > tf.constant(rand_threshold[0])
+        condition1 = random_int[0] > tf.constant(rand_threshold[1])
+    
+    if net_type == 'cls':
         def lossfun(y_true, y_pred):
-            if print_progress: condition = tf.Print(condition1, ['rand int[0]:', random_int[0],
-                                                    ' tf.constant:', tf.constant(rand_threshold[1]),
-                                                    ' condition1:', condition1 ])
-            val= tf.case({ condition1: lambda: K.mean(K.square(y_pred - y_true), axis=-1),
-                           condition0: lambda: 0 * K.mean(K.square(y_true), axis=-1)
-                           },
-                         default=lambda:0 * K.mean(K.square(y_true), axis=-1),
-                         exclusive=False )
 
-            if print_progress: val = tf.Print(val, ['cls loss out:',val,
-                                                    ' rand int received:',random_int,
-                                                    'condition',condition1])
-            val.set_shape(K.mean(K.square(y_true), axis=-1).shape)
+            y_mean_square = backend.mean(backend.square(y_true), axis=-1)
+    
+            if train_tasks == 2:
+                if print_progress: 
+                    tf.Print( condition0, [ 
+                            'rand int[0]:', random_int[0],
+                            ' tf.constant:', tf.constant(rand_threshold[0]),
+                            ' condition0:', condition0 ])
+                val= tf.case(
+                        { 
+                            condition0: lambda: backend.mean(
+                                backend.square(y_pred - y_true), 
+                                axis=-1) 
+                        },
+                        default = lambda: 0 * y_mean_square,
+                        exclusive=False )
+
+                if print_progress: 
+                    tf.Print( val, [ 'cls loss out:',val ])
+            else:
+                if print_progress: 
+                    tf.Print( condition0, [ 
+                            'rand int[0]:', random_int[0],
+                            ' tf.constant:', tf.constant(rand_threshold[0]),
+                            ' condition0:', condition0 ])
+                    tf.Print( condition1, [ 
+                            'rand int[1]:', random_int[1],
+                            ' tf.constant:', tf.constant(rand_threshold[1]),
+                            ' condition1:', condition1 ])
+                val= tf.case(
+                        { 
+                            condition1: lambda: backend.mean(
+                                    backend.square(y_pred - y_true), 
+                                    axis=-1),
+                            condition0: lambda: 0 * y_mean_square
+                        },
+                        default = lambda: 0 * y_mean_square,
+                        exclusive=False )
+                if print_progress: 
+                    tf.Print( val, [ 'cls loss out:',val ]) 
+               
+            val.set_shape(y_mean_square.shape)
+            
             return val
-    elif type =='roi':
+        
+    elif net_type == 'bbx':
         def lossfun(y_true, y_pred):
-            if print_progress: condition = tf.Print(condition1, ['rand int[0]:', random_int[0],
-                                                                ' tf.constant:', tf.constant(rand_threshold),
-                                                                ' condition:', condition1])
-            val= tf.case({ condition1: lambda: 0 * K.mean(K.square(y_true), axis=-1),
-                           condition0: lambda: K.mean(K.square(y_pred - y_true), axis=-1)
-                         },
-                         default=lambda: 0 * K.mean(K.square(y_true), axis=-1),exclusive=False)
-            if print_progress: val = tf.Print(val, ['roi loss out :', val,
-                                                    ' rand int received:', random_int,
-                                                    'condition', condition1])
-            val.set_shape(K.mean(K.square(y_true), axis=-1).shape)
+            
+            y_mean_square = backend.mean(backend.square(y_true), axis=-1)
+            
+            if train_tasks == 2:
+                
+                if print_progress: 
+                    tf.Print( condition1, [ 
+                            'rand int[0]:', random_int[0],
+                            ' tf.constant:', tf.constant(rand_threshold[0]),
+                            ' condition1:', condition1 ])
+                val= tf.case(
+                        { 
+                            condition1: lambda: backend.mean(
+                                backend.square(y_pred - y_true), 
+                                axis=-1) 
+                        },
+                        default = lambda: 0 * y_mean_square,
+                        exclusive=False )
+
+                if print_progress: 
+                    tf.Print( val, [ 'bbx loss out:',val ])
+            else:
+                if print_progress: 
+                    tf.Print( condition0, [ 
+                            'rand int[0]:', random_int[0],
+                            ' tf.constant:', tf.constant(rand_threshold[0]),
+                            ' condition0:', condition0 ])
+                    tf.Print( condition1, [ 
+                            'rand int[1]:', random_int[1],
+                            ' tf.constant:', tf.constant(rand_threshold[1]),
+                            ' condition1:', condition1 ])
+                val= tf.case(
+                        { 
+                            condition1: lambda: 0 * y_mean_square,
+                            condition0: lambda: lambda: backend.mean(
+                                    backend.square(y_pred - y_true), 
+                                    axis=-1),
+                        },
+                        default = lambda: 0 * y_mean_square,
+                        exclusive=False )
+                if print_progress: 
+                    tf.Print( val, [ 'bbx loss out:', val ]) 
+                    
+            val.set_shape(y_mean_square.shape)
+    
             return val
     else :
         def lossfun(y_true, y_pred):
-            if print_progress: condition = tf.Print(condition1, ['rand int[0]:', random_int[0],
-                                                                 ' tf.constant:', tf.constant(rand_threshold),
-                                                                 ' condition:', condition1])
-            val = tf.case({condition1: lambda: 0 * K.mean(K.square(y_true), axis=-1),
-                           condition0: lambda: 0 * K.mean(K.square(y_true), axis=-1)
-                           },
-                          default=lambda: K.mean(K.square(y_pred - y_true), axis=-1),exclusive=False)
-            val.set_shape(K.mean(K.square(y_true), axis=-1).shape)
-            if print_progress: val = tf.Print(val, ['pts loss out :', val,
-                                                    ' rand int received:', random_int,
-                                                    'condition', condition1])
+            
+            y_mean_square = backend.mean(backend.square(y_true), axis=-1)
+ 
+            if print_progress: 
+                tf.Print( condition0, [ 
+                        'rand int[0]:', random_int[0],
+                        ' tf.constant:', tf.constant(rand_threshold[0]),
+                        ' condition0:', condition0 ])
+                tf.Print( condition1, [ 
+                        'rand int[1]:', random_int[1],
+                        ' tf.constant:', tf.constant(rand_threshold[1]),
+                        ' condition1:', condition1 ])
+            val= tf.case(
+                    { 
+                        condition1: lambda: 0 * y_mean_square,
+                        condition0: lambda: 0 * y_mean_square,
+                    },
+                    default = lambda: backend.mean(
+                                backend.square(y_pred - y_true), 
+                                axis=-1),
+                    exclusive=False )
+                    
+            if print_progress: 
+                tf.Print( val, [ 'pts loss out:',val])                
+            
+            val.set_shape(y_mean_square.shape)
+            
             return val
+
     return lossfun
 
-def accuracy (y_pred,y_true):
-    return K.mean(y_true)
 
-def train_net(Net, training_data, base_lr, loss_weight,
-              train_mode, num_epochs=[1, None, None],
-              batch_size=64, load_model=False, load_filename=None,
+def accuracy_mean(y_pred,y_true):
+    return backend.mean(y_true)
+
+
+def train_net(Net, training_data, base_lr,
+              num_epochs=1, batch_size=64, 
+              load_filename=None,
               save_model=False, save_filename=None,
               num_iter_to_save=10000):
 
-    images = []
-    labels = []
+    train_images = []
+    train_labels = []
     tasks = ['cls', 'bbx', 'pts']
     if Net.__name == 'PNet':
         shape_size = 12
-        train_input = [Input(shape=[shape_size, shape_size, 3]),
-                       Input(shape=[shape_size, shape_size, 3])]
-                       
+        train_mode = 2
     elif Net.__name__ == 'RNet':
         shape_size = 24
-        train_input = [Input(shape=[shape_size, shape_size, 3]),
-                       Input(shape=[shape_size, shape_size, 3])]
+        train_mode = 2
     elif Net.__name__ == 'ONet':
         shape_size = 48
-        train_input = [Input(shape=[shape_size, shape_size, 3]),
-                       Input(shape=[shape_size, shape_size, 3]),
-                       Input(shape=[shape_size, shape_size, 3])]
+        train_mode = 3
     else:
         raise Exception('Invalid training net model')
     
-    input, random_int = Lambda(data_input)(train_input)
-    
     for index in range(train_mode):
-        image, label = prepare_train_inputs(filename=[training_data[index]],
-                              batch_size=batch_size,
-                              num_epochs=num_epochs[index],
-                              label_type=tasks[index],
-                              shape=shape_size)
-        images.append(image)
-        labels.append(label)
+        image, label = prepare_train_inputs(
+            filename=[training_data[index]],
+            batch_size=batch_size,
+            num_epochs=num_epochs[index],
+            label_type=tasks[index],
+            shape=shape_size)
+        train_images.append(image)
+        train_labels.append(label)
     
     
-    net = Net((images)
-    my_adam = adam(lr = 0.00001)
+    mtcnn_adam = Adam(lr = base_lr)
 
-    out_put = net.get_all_output()
-    cls_output = tf.reshape(out_put[0], [-1, 2])
-    bbx_output = tf.reshape(out_put[1], [-1, 4])
-    pts_output = tf.reshape(out_put[2], [-1, 10])
+    mtcnn_net = Net(mode='train', weights_path=load_filename)
+    mtcnn_net.compile(loss=[mtcnn_loss('cls'), mtcnn_loss('bbx')],
+                      optimizer=mtcnn_adam, 
+                      metrics=[accuracy_mean, accuracy_mean])    
+    
+    # Create a callback that saves the model's weights
+    cp_callback = tf.keras.callbacks.ModelCheckpoint(
+            filepath=save_filename,
+            save_weights_only=True, verbose=1)
+    
+    mtcnn_net.fit(train_images, train_labels, batch_size=batch_size, 
+                  epochs=num_epochs, 
+                  callbacks=[cp_callback])
 
-    # cls loss
-    softmax_loss = loss_weight[0] * \
-        tf.reduce_mean(
-        tf.nn.softmax_cross_entropy_with_logits(labels=labels[0],
-                                                logits=cls_output))
-    weight_losses_cls = net.get_weight_decay()['cls']
-    losses_cls = softmax_loss + tf.add_n(weight_losses_cls)
 
-    # bbx loss
-    square_bbx_loss = loss_weight[1] * \
-        tf.reduce_mean(tf.squared_difference(bbx_output, labels[1]))
-    weight_losses_bbx = net.get_weight_decay()['bbx']
-    losses_bbx = square_bbx_loss + tf.add_n(weight_losses_bbx)
 
-    # pts loss
-    square_pts_loss = loss_weight[2] * \
-        tf.reduce_mean(tf.squared_difference(pts_output, labels[2]))
-    weight_losses_pts = net.get_weight_decay()['pts']
-    losses_pts = square_pts_loss + tf.add_n(weight_losses_pts)
 
-    global_step_cls = tf.Variable(1, name='global_step_cls', trainable=False)
-    global_step_bbx = tf.Variable(1, name='global_step_bbx', trainable=False)
-    global_step_pts = tf.Variable(1, name='global_step_pts', trainable=False)
-
-    train_cls = tf.train.AdamOptimizer(learning_rate=base_lr) \
-                        .minimize(losses_cls, global_step=global_step_cls)
-    train_bbx = tf.train.AdamOptimizer(learning_rate=base_lr) \
-                        .minimize(losses_bbx, global_step=global_step_bbx)
-    train_pts = tf.train.AdamOptimizer(learning_rate=base_lr) \
-                        .minimize(losses_pts, global_step=global_step_pts)
-
-    init_op = tf.group(tf.global_variables_initializer(),
-                       tf.local_variables_initializer())
-
-    config = tf.ConfigProto()
-    config.allow_soft_placement = True
-    config.gpu_options.per_process_gpu_memory_fraction = gpu_memory_fraction
-    config.gpu_options.allow_growth = True
-
-    loss_agg_cls = [0]
-    loss_agg_bbx = [0]
-    loss_agg_pts = [0]
-    step_value = [1, 1, 1]
-
-    with tf.Session(config=config) as sess:
-        sess.run(init_op)
-        saver = tf.train.Saver(max_to_keep=200000)
-        if load_model:
-            saver.restore(sess, load_filename)
-        else:
-            net.load(load_filename, sess, prefix)
-        if save_model:
-            save_dir = os.path.split(save_filename)[0]
-            if not os.path.exists(save_dir):
-                os.makedirs(save_dir)
-        coord = tf.train.Coordinator()
-        threads = tf.train.start_queue_runners(sess=sess, coord=coord)
-        try:
-            while not coord.should_stop():
-                choic = np.random.randint(0, train_mode)
-                if choic == 0:
-                    _, loss_value_cls, step_value[0] = sess.run(
-                        [train_cls, softmax_loss, global_step_cls])
-                    loss_agg_cls.append(loss_value_cls)
-                elif choic == 1:
-                    _, loss_value_bbx, step_value[1] = sess.run(
-                        [train_bbx, square_bbx_loss, global_step_bbx])
-                    loss_agg_bbx.append(loss_value_bbx)
-                else:
-                    _, loss_value_pts, step_value[2] = sess.run(
-                        [train_pts, square_pts_loss, global_step_pts])
-                    loss_agg_pts.append(loss_value_pts)
-
-                if sum(step_value) % (100 * train_mode) == 0:
-                    agg_cls = sum(loss_agg_cls) / len(loss_agg_cls)
-                    agg_bbx = sum(loss_agg_bbx) / len(loss_agg_bbx)
-                    agg_pts = sum(loss_agg_pts) / len(loss_agg_pts)
-                    print(
-                        'Step %d for cls: loss = %.5f' %
-                        (step_value[0], agg_cls), end='. ')
-                    print(
-                        'Step %d for bbx: loss = %.5f' %
-                        (step_value[1], agg_bbx), end='. ')
-                    print(
-                        'Step %d for pts: loss = %.5f' %
-                        (step_value[2], agg_pts))
-                    loss_agg_cls = [0]
-                    loss_agg_bbx = [0]
-                    loss_agg_pts = [0]
-
-                if save_model and (step_value[0] % num_iter_to_save == 0):
-                    saver.save(sess, save_filename, global_step=step_value[0])
-
-        except tf.errors.OutOfRangeError:
-            print(
-                'Done training for %d epochs, %d steps.' %
-                (num_epochs[0], step_value[0]))
-        finally:
-            coord.request_stop()
-
-        coord.join(threads)
