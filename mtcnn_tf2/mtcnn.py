@@ -1,15 +1,22 @@
 """Main script. Contain model definition and training code."""
 import os
-import gc
-import tensorflow as tf
 import numpy as np
+
+import tensorflow as tf
+from tensorflow.compat.v1 import parse_single_example, FixedLenFeature
+from tensorflow.compat.v1 import decode_raw
+
 from tensorflow.keras.layers import Conv2D, Input, MaxPool2D, Lambda
 from tensorflow.keras.layers import Flatten, Reshape
 from tensorflow.keras.layers import Dense, Permute, Softmax, PReLU
 from tensorflow.keras.models import Model
 from tensorflow.keras import backend
 from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import ModelCheckpoint, CSVLogger
+from tensorflow.keras.utils import to_categorical
 
+from matplotlib import pyplot as plt
+from sklearn.model_selection import train_test_split
 
 class NetWork(object):
 
@@ -60,6 +67,7 @@ class NetWork(object):
         val.set_shape(net_inputs[0].shape)
         return [val,random_int]# tuple (output,random_int ) is NOT allowed
 
+
 class PNet(NetWork):
 
     def create_pnet(self):
@@ -109,31 +117,38 @@ class PNet(NetWork):
         return self.create_pnet()
 
 
-def read_and_decode(serialized_data, label_type, shape):
-    context, sequence = tf.parse_single_example(
+def read_and_decode(serialized_data):
+    context, sequence = parse_single_example(
         serialized_data,
         features={
-            'image_raw': tf.FixedLenFeature([], tf.string),
-            'label_raw': tf.FixedLenFeature([], tf.string),
+            'image_raw': FixedLenFeature([], tf.string),
+            'label_raw': FixedLenFeature([], tf.string),
         })
-    image = tf.decode_raw(context['image_raw'], tf.uint8)
+    print('context: ')
+    print(context)
+    image = decode_raw(context[0], tf.uint8)
+    print('image: ' + str(image))
     image = tf.cast(image, tf.float32)
+    print('cast: ' + str(image))
+    label = decode_raw(context[1], tf.float32)
+    print('cast: ' + str(label))
 
-    image = (image - 127.5) * (1. / 128.0)
-    image.set_shape([shape * shape * 3])
-    image = tf.reshape(image, [shape, shape, 3])
-    label = tf.decode_raw(context['label_raw'], tf.float32)
+    return [image, label]
 
-    if label_type == 'cls':
-        image = tf.image.random_flip_left_right(image)
-        image = tf.image.random_flip_up_down(image)
-        label.set_shape([2])
-    elif label_type == 'bbx':
-        label.set_shape([4])
-    elif label_type == 'pts':
-        label.set_shape([10])
-
-    return image, label
+#    image = (image - 127.5) * (1. / 128.0)
+#    image.set_shape([shape * shape * 3])
+#    image = tf.reshape(image, [shape, shape, 3])
+#    
+#    if label_type == 'cls':
+#        image = tf.image.random_flip_left_right(image)
+#        image = tf.image.random_flip_up_down(image)
+#        label.set_shape([2])
+#    elif label_type == 'bbx':
+#        label.set_shape([4])
+#    elif label_type == 'pts':
+#        label.set_shape([10])
+#
+#    return [image, label]
 
 
 def prepare_train_inputs(tfrecords_filename, batch_size, 
@@ -141,7 +156,7 @@ def prepare_train_inputs(tfrecords_filename, batch_size,
     #capacity=1000 + 3 * batch_size
     
     images, labels = tf.data.TFRecordDataset(tfrecords_filename) \
-                    .map(lambda x: read_and_decode(x, label_type, shape))
+                    .map(read_and_decode)
                     #.shuffle(capacity) \
                     #.batch(batch_size) \
                     #.repeat(num_epochs) \
@@ -296,16 +311,20 @@ def accuracy_mean(y_pred,y_true):
     return backend.mean(y_true)
 
 
-def train_net(Net, training_data, base_lr,
+def train_net(Net, training_data_files, base_lr,
               num_epochs=1, batch_size=64, 
-              load_filename=None,
-              save_model=False, save_filename=None,
-              num_iter_to_save=10000):
+              save_filename=None):
 
+    rnd_seed = 49
+    np.random.seed(rnd_seed)
+    
     train_images = []
     train_labels = []
+    test_images = []
+    test_labels = []
+    
     tasks = ['cls', 'bbx', 'pts']
-    if Net.__name == 'PNet':
+    if Net.__name__ == 'PNet':
         shape_size = 12
         train_mode = 2
     elif Net.__name__ == 'RNet':
@@ -318,32 +337,71 @@ def train_net(Net, training_data, base_lr,
         raise Exception('Invalid training net model')
     
     for index in range(train_mode):
-        image, label = prepare_train_inputs(
-            filename=[training_data[index]],
+        data_images, data_labels = prepare_train_inputs(
+            tfrecords_filename=training_data_files[index],
             batch_size=batch_size,
-            num_epochs=num_epochs[index],
+            num_epochs=num_epochs,
             label_type=tasks[index],
             shape=shape_size)
-        train_images.append(image)
-        train_labels.append(label)
-    
-    
+        
+        X_train, X_test, y_train, y_test = train_test_split(
+                data_images, data_labels,
+                test_size=1/3,
+                random_state=rnd_seed)
+        
+        train_images.append(X_train)
+        test_images.append(X_test)
+        
+        if tasks[index] == 'cls':
+            y_train = to_categorical(y_train, num_classes=2)
+            y_test = to_categorical(y_test, num_classes=2)
+                
+        train_labels.append(y_train)
+        test_labels.append(y_test)
+        
     mtcnn_adam = Adam(lr = base_lr)
 
-    mtcnn_net = Net(mode='train', weights_path=load_filename)
+    mtcnn_net = Net(mode='train', weights_path=save_filename)
     mtcnn_net.compile(loss=[mtcnn_loss('cls'), mtcnn_loss('bbx')],
                       optimizer=mtcnn_adam, 
                       metrics=[accuracy_mean, accuracy_mean])    
     
     # Create a callback that saves the model's weights
-    cp_callback = tf.keras.callbacks.ModelCheckpoint(
-            filepath=save_filename,
-            save_weights_only=True, verbose=1)
+    cp_callback = ModelCheckpoint(  filepath=save_filename,
+                                    save_weights_only=True, 
+                                    verbose=1,
+                                    save_best_only=True,
+                                    mode='max')
+
+    # Log the epoch detail into csv
+    csv_logger = CSVLogger(save_filename + '.csv')
     
-    mtcnn_net.fit(train_images, train_labels, batch_size=batch_size, 
+    mtcnn_net.fit(train_images, train_labels, 
+                  validation_data=(test_images, test_labels),
+                  batch_size=batch_size, 
                   epochs=num_epochs, 
-                  callbacks=[cp_callback])
+                  callbacks=[cp_callback, csv_logger])
+
+def train_pnet(training_data_files, base_lr,
+               num_epochs, save_filename=None):
+
+    train_net(Net=PNet,
+              training_data_files=training_data_files,
+              base_lr=base_lr,
+              num_epochs=num_epochs,
+              save_filename=save_filename)
 
 
+if __name__ == '__main__':
+
+    model_filename = '../data/mtcnn_training/saved_model/pnet.hdf5'
+    training_data_files = ['../data/mtcnn_training/native_12/' + 
+                     'pnet_data_for_cls.tfrecords',
+                     '../data/mtcnn_training/native_12/' + 
+                     'pnet_data_for_bbx.tfrecords']
+    train_pnet(training_data_files=training_data_files,
+               base_lr=0.0001,
+               num_epochs=1,
+               save_filename=model_filename)
 
 
