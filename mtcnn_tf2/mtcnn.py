@@ -2,6 +2,7 @@
 import os
 import numpy as np
 import pandas as pd
+from functools import partial
 from matplotlib import pyplot as plt
 from sklearn.model_selection import train_test_split
 
@@ -125,8 +126,9 @@ class PNet(NetWork):
         return self.create_pnet()
 
 
-def read_and_decode(serialized_data):
+def read_and_decode(serialized_data, label_type, shape):
     print('serialized_data: ' + serialized_data)
+    print(f'label_type: {label_type}, shape: {shape}')
     features = {
         'label_raw': tf.io.FixedLenFeature([], tf.string),
         'image_raw': tf.io.FixedLenFeature([], tf.string),}
@@ -134,7 +136,21 @@ def read_and_decode(serialized_data):
             serialized_data, features)
 
     print(f'parsed_dataset: {parsed_dataset}')
-    return parsed_dataset
+    image = tf.io.decode_raw(parsed_dataset['image_raw'], tf.uint8)
+    #print(f'image: {image}')
+    image = tf.cast(image, tf.float32)
+    image = (image - 127.5) * (1. / 128.0)
+    image = tf.reshape(image, [shape, shape, 3])
+    
+    label_shape = get_label_shape(label_type)    
+    label = tf.io.decode_raw(parsed_dataset['label_raw'], tf.float32)
+    label.set_shape([label_shape])
+        
+    if label_type == 'cls':
+        image = tf.image.random_flip_left_right(image)
+        image = tf.image.random_flip_up_down(image)
+    
+    return image, label
 
 def get_label_shape(label_type):
     label_shape = -1
@@ -152,48 +168,61 @@ def get_label_shape(label_type):
 # max_data_size 
 # - 0 or negative number -> no limit
 # - Positive number -> limit data length
-def prepare_train_inputs(tfrecords_filename, batch_size, 
+def prepare_train_test_inputs(tfrecords_filename, batch_size, 
                          num_epochs, label_type, shape,
                          max_data_size=10):
     dataset = tf.data.TFRecordDataset(tfrecords_filename)
+    dataset = dataset.repeat(num_epochs)
+    dataset = dataset.shuffle(batch_size * 4)
     
-    parsed_dataset = dataset.map(read_and_decode)
-    images_dataset = []
-    labels_dataset = []
-    data_count = 0
-    label_shape = get_label_shape(label_type)
+    map_func = lambda x: read_and_decode(x, label_type, shape)
+    parsed_dataset = dataset.map(map_func)
+    parsed_dataset = parsed_dataset.batch(batch_size, drop_remainder=True)
     
-    for data_line in parsed_dataset:
-        data_count += 1
-        if max_data_size > 0 and data_count > max_data_size:
+    train_images_dataset = []
+    train_labels_dataset = []
+    test_images_dataset = []
+    test_labels_dataset = []
+    
+    batch_count = 0
+    
+    for batch_line in parsed_dataset:
+        batch_count += 1
+        images, labels = batch_line
+        
+        if max_data_size > 0 and batch_count * batch_size > max_data_size:
             break
         
-        image = tf.io.decode_raw(data_line['image_raw'], tf.uint8)
-        #print(f'image: {image}')
-        image = tf.cast(image, tf.float32)
-        image = (image - 127.5) * (1. / 128.0)
-        image = tf.reshape(image, [shape, shape, 3])
+        # Test : Training = 1 : 3
+        if batch_count % 4 == 0:
+            test_images_dataset.extend(images)
+            test_labels_dataset.extend(labels)
+        else:
+            train_images_dataset.extend(images)
+            train_labels_dataset.extend(labels)
         
-        label = tf.io.decode_raw(data_line['label_raw'], tf.float32)
-        label.set_shape([label_shape])
+    train_images_dataset = np.array(train_images_dataset)
+    print(f"train_images_dataset shape: {train_images_dataset.shape}")
+
+    test_images_dataset = np.array(test_images_dataset)
+    print(f"test_images_dataset shape: {test_images_dataset.shape}")
+
+#    label_shape = get_label_shape(label_type)
+    train_labels_dataset = np.array(train_labels_dataset)
+    test_labels_dataset = np.array(test_labels_dataset)
+    
+#    if label_type == 'cls':
+#        train_labels_dataset = to_categorical(train_labels_dataset, 
+#                                              num_classes=2)
+#        test_labels_dataset = to_categorical(test_labels_dataset, 
+#                                              num_classes=2)
         
-        if label_type == 'cls':
-            image = tf.image.random_flip_left_right(image)
-            image = tf.image.random_flip_up_down(image)
+    print(f"train_labels_dataset shape: {train_labels_dataset.shape}")
+    print(f"test_labels_dataset shape: {test_labels_dataset.shape}")
 
-        images_dataset.append(image)
-        labels_dataset.append(label)
+    return train_images_dataset, test_images_dataset, \
+           train_labels_dataset, test_labels_dataset
 
-    images_array = np.array(images_dataset)
-    print(f"images_array shape: {images_array.shape}")
-
-    labels_array = np.array(labels_dataset)
-    if label_type == 'cls':
-        labels_array = to_categorical(labels_array, num_classes=2)
-
-    print(f"labels_array shape: {labels_array.shape}")
-
-    return images_array, labels_array
 
 def mtcnn_loss(net_type, train_tasks=2, rand_threshold=[0.5]): # need to make sure input type
     random_int = tf.random.uniform([1])
@@ -336,13 +365,14 @@ def accuracy_mean(y_pred,y_true):
 
 def train_net(Net, training_data_files, base_lr,
               num_epochs=1, batch_size=64, 
-              save_filename=None):
+              save_filename=None,
+              max_data_size=1280):
 
     rnd_seed = 49
     np.random.seed(rnd_seed)
     tf.random.set_seed(rnd_seed)
     
-    max_data_size = 128
+    print(f"max_data_size: {max_data_size}")
     
     train_images = []
     train_labels = []
@@ -363,7 +393,7 @@ def train_net(Net, training_data_files, base_lr,
         raise Exception('Invalid training net model')
     
     for index in range(train_mode):
-        data_images, data_labels = prepare_train_inputs(
+        X_train, X_test, y_train, y_test = prepare_train_test_inputs(
             tfrecords_filename=training_data_files[index],
             batch_size=batch_size,
             num_epochs=num_epochs,
@@ -371,16 +401,14 @@ def train_net(Net, training_data_files, base_lr,
             shape=shape_size,
             max_data_size=max_data_size)
         
-        X_train, X_test, y_train, y_test = train_test_split(
-                data_images, data_labels,
-                test_size=1/3,
-                random_state=rnd_seed)
-        
+        print(f"X_train shape: {X_train.shape}, X_test shape: {X_test.shape}")
         train_images.append(X_train)
         test_images.append(X_test)
                 
+        print(f"y_train shape: {y_train.shape}, y_test shape: {y_test.shape}")
         train_labels.append(y_train)
         test_labels.append(y_test)
+
         
     mtcnn_adam = Adam(lr = base_lr)
 
@@ -397,8 +425,9 @@ def train_net(Net, training_data_files, base_lr,
                                     save_best_only=True,
                                     mode='min')
 
+    base_file_name = os.path.splitext(save_filename)[0]
     # Log the epoch detail into csv
-    csv_out_path = save_filename + '.csv'
+    csv_out_path = base_file_name + '.csv'
     csv_logger = CSVLogger(csv_out_path)
     
     mtcnn_net_model.fit(train_images, train_labels, 
@@ -410,7 +439,8 @@ def train_net(Net, training_data_files, base_lr,
     plot_training_model(csv_out_path)
     
     # Model PDF file
-    model_pdf_file = save_filename + '.pdf'
+    
+    model_pdf_file = base_file_name + '.pdf'
     save_training_model(mtcnn_net_model, model_pdf_file)
 
 
@@ -429,21 +459,30 @@ def plot_training_model(training_csv_path):
 
 
 def save_training_model(model, model_pdf_file):
-    plot_model(model, 
+    try:
+        plot_model(model, 
            to_file=model_pdf_file, 
            show_shapes=True, 
            show_layer_names=False,
            rankdir='TB')
+    except Exception as exp:
+        #print(f"Save model pdf error: {exp}")
+        pass
 
 
 def train_pnet(training_data_files, base_lr,
-               num_epochs, save_filename=None):
+               num_epochs, 
+               batch_size,
+               save_filename=None,
+               max_data_size=1280):
 
     train_net(Net=PNet,
               training_data_files=training_data_files,
               base_lr=base_lr,
               num_epochs=num_epochs,
-              save_filename=save_filename)
+              batch_size=batch_size,
+              save_filename=save_filename,
+              max_data_size=max_data_size)
 
 
 if __name__ == '__main__':
@@ -453,9 +492,15 @@ if __name__ == '__main__':
                      'pnet_data_for_cls.tfrecords',
                      '../data/mtcnn_training/native_12/' + 
                      'pnet_data_for_bbx.tfrecords']
+    
+    # max_data_size
+    # 0 or Negative - All data were used
+    # Positive - Limit number of data were used
     train_pnet(training_data_files=training_data_files,
                base_lr=0.0001,
-               num_epochs=1,
-               save_filename=model_filename)
+               num_epochs=3,
+               batch_size=64,
+               save_filename=model_filename,
+               max_data_size=5000)
 
 
