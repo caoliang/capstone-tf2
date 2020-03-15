@@ -1,0 +1,2 @@
+epoch,loss,reshape_4_accuracy_mean,reshape_4_loss,reshape_5_accuracy_mean,reshape_5_loss,val_loss,val_reshape_4_accuracy_mean,val_reshape_4_loss,val_reshape_5_accuracy_mean,val_reshape_5_loss
+0,0.018970252485836253,0.5,0.0,0.0015360939,0.017172627,0.01744549162685871,0.5,0.0,0.0015022238,0.017445492

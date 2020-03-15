@@ -1,71 +1,79 @@
 """Main script. Contain model definition and training code."""
 import os
 import numpy as np
+import pandas as pd
+from matplotlib import pyplot as plt
+from sklearn.model_selection import train_test_split
 
 import tensorflow as tf
-from tensorflow.compat.v1 import parse_single_example, FixedLenFeature
-from tensorflow.compat.v1 import decode_raw
-
 from tensorflow.keras.layers import Conv2D, Input, MaxPool2D, Lambda
-from tensorflow.keras.layers import Flatten, Reshape
-from tensorflow.keras.layers import Dense, Permute, Softmax, PReLU
+from tensorflow.keras.layers import Reshape, PReLU
 from tensorflow.keras.models import Model
 from tensorflow.keras import backend
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import ModelCheckpoint, CSVLogger
-from tensorflow.keras.utils import to_categorical
+from tensorflow.keras.utils import to_categorical, plot_model
 
-from matplotlib import pyplot as plt
-from sklearn.model_selection import train_test_split
+
 
 class NetWork(object):
 
-    def __init__(self, mode='data', rnd_thresholds=None, weights_path=None):
+    def __init__(self, mode='data',  
+                 weights_path=None,
+                 train_inputs=None,
+                 net_thresholds=None):
 
         self.mode = mode
-        self.rnd_thresholds = rnd_thresholds
         self.weights_path = weights_path
+        self.train_inputs = train_inputs
+        self.net_thresholds = net_thresholds
         
         # Network model
         self.net_model = self.setup()
         # Load weights if available
         self.load()
 
-    def setup(self):
+    def setup(self, train_inputs=None):
         raise NotImplementedError('Must be implemented by the subclass.')
 
     def load(self):
         if os.path.exists(self.weights_path):
-            self.net_model.load_weights_file(self.weights_path, by_name=True)
+            self.net_model.load_weights(self.weights_path, by_name=True)
 
     def get_net_model(self):
         return self.net_model
 
-    def get_data_input(self, net_inputs, thresholds=None):
-        random_int = tf.random_uniform([1])
+    def get_train_input(self, net_inputs):
+        thresholds = self.net_thresholds
+        
+        random_int = tf.random.uniform([1])
         net_inputs_len = len(net_inputs)
         if net_inputs_len == 2:
-            if thresholds is None: thresholds = [0.5]
+            if thresholds is None: 
+                thresholds = [0.5]
             
-            condition = random_int[0] > tf.constant(thresholds[0])
-            val = tf.case({condition: lambda: net_inputs[0]},
-                          default=lambda: net_inputs[1])
+            condition0 = random_int[0] > tf.constant(thresholds[0])
+            
+            val = tf.case([(condition0, (lambda: net_inputs[0]))],
+                           default=(lambda: net_inputs[1]),
+                           exclusive = False)
+            
         elif net_inputs_len == 3:
-            if thresholds is None: thresholds = [0.4, 0.9]
+            if thresholds is None: 
+                thresholds = [0.4, 0.9]
             
             condition0 = random_int[0] > tf.constant(thresholds[0])
             condition1 = random_int[0] > tf.constant(thresholds[1])
             
-            val = tf.case({condition1: lambda: net_inputs[1],
-                           condition0: lambda: net_inputs[2],
-                           },
+            val = tf.case([(condition1, lambda: net_inputs[1]),
+                           (condition0, lambda: net_inputs[2])],
                            default=lambda: net_inputs[2],
                            exclusive = False)
         else:
             raise Exception(f'Invalid net_inputs size: {len(net_inputs)}')
         
         val.set_shape(net_inputs[0].shape)
-        return [val,random_int]# tuple (output,random_int ) is NOT allowed
+        return [val,random_int]
 
 
 class PNet(NetWork):
@@ -74,9 +82,9 @@ class PNet(NetWork):
         if self.mode == 'data':
             p_inp = Input(shape = [12, 12, 3])
         else:
-            train_inputs = [Input(shape = [12, 12, 3]),
-                            Input(shape = [12, 12, 3])]
-            p_inp = Lambda(self.get_data_input)(train_inputs)
+            train_inp = [Input(shape = [12, 12, 3]),
+                         Input(shape = [12, 12, 3])]
+            (p_inp, random_int) = Lambda(self.get_train_input)(train_inp)
     
         p_layer = Conv2D(10, kernel_size=(3, 3), strides=(1, 1), 
                          padding="valid", name='conv1')(p_inp)
@@ -109,7 +117,7 @@ class PNet(NetWork):
             p_bbox_regress = Conv2D(4, kernel_size=(1, 1), strides=(1, 1), 
                               name='bbox1')(p_layer)
             p_bbox_regress = Reshape((4,))(p_bbox_regress)
-            p_net = Model([p_inp], [p_classifier, p_bbox_regress])
+            p_net = Model(train_inp, [p_classifier, p_bbox_regress])
        
         return p_net
     
@@ -118,53 +126,77 @@ class PNet(NetWork):
 
 
 def read_and_decode(serialized_data):
-    context, sequence = parse_single_example(
-        serialized_data,
-        features={
-            'image_raw': FixedLenFeature([], tf.string),
-            'label_raw': FixedLenFeature([], tf.string),
-        })
-    print('context: ')
-    print(context)
-    image = decode_raw(context[0], tf.uint8)
-    print('image: ' + str(image))
-    image = tf.cast(image, tf.float32)
-    print('cast: ' + str(image))
-    label = decode_raw(context[1], tf.float32)
-    print('cast: ' + str(label))
+    print('serialized_data: ' + serialized_data)
+    features = {
+        'label_raw': tf.io.FixedLenFeature([], tf.string),
+        'image_raw': tf.io.FixedLenFeature([], tf.string),}
+    parsed_dataset = tf.io.parse_single_example(
+            serialized_data, features)
 
-    return [image, label]
+    print(f'parsed_dataset: {parsed_dataset}')
+    return parsed_dataset
 
-#    image = (image - 127.5) * (1. / 128.0)
-#    image.set_shape([shape * shape * 3])
-#    image = tf.reshape(image, [shape, shape, 3])
-#    
-#    if label_type == 'cls':
-#        image = tf.image.random_flip_left_right(image)
-#        image = tf.image.random_flip_up_down(image)
-#        label.set_shape([2])
-#    elif label_type == 'bbx':
-#        label.set_shape([4])
-#    elif label_type == 'pts':
-#        label.set_shape([10])
-#
-#    return [image, label]
+def get_label_shape(label_type):
+    label_shape = -1
+    if label_type == 'cls':
+        label_shape = 2
+    elif label_type == 'bbx':
+        label_shape = 4
+    elif label_type == 'pts':
+        label_shape = 10
+    else:
+        raise Exception(f"Invalid label type: {label_type}")
+        
+    return label_shape
 
-
+# max_data_size 
+# - 0 or negative number -> no limit
+# - Positive number -> limit data length
 def prepare_train_inputs(tfrecords_filename, batch_size, 
-                         num_epochs, label_type, shape):
-    #capacity=1000 + 3 * batch_size
+                         num_epochs, label_type, shape,
+                         max_data_size=10):
+    dataset = tf.data.TFRecordDataset(tfrecords_filename)
     
-    images, labels = tf.data.TFRecordDataset(tfrecords_filename) \
-                    .map(read_and_decode)
-                    #.shuffle(capacity) \
-                    #.batch(batch_size) \
-                    #.repeat(num_epochs) \
-                    
-    return images, labels
+    parsed_dataset = dataset.map(read_and_decode)
+    images_dataset = []
+    labels_dataset = []
+    data_count = 0
+    label_shape = get_label_shape(label_type)
+    
+    for data_line in parsed_dataset:
+        data_count += 1
+        if max_data_size > 0 and data_count > max_data_size:
+            break
+        
+        image = tf.io.decode_raw(data_line['image_raw'], tf.uint8)
+        #print(f'image: {image}')
+        image = tf.cast(image, tf.float32)
+        image = (image - 127.5) * (1. / 128.0)
+        image = tf.reshape(image, [shape, shape, 3])
+        
+        label = tf.io.decode_raw(data_line['label_raw'], tf.float32)
+        label.set_shape([label_shape])
+        
+        if label_type == 'cls':
+            image = tf.image.random_flip_left_right(image)
+            image = tf.image.random_flip_up_down(image)
+
+        images_dataset.append(image)
+        labels_dataset.append(label)
+
+    images_array = np.array(images_dataset)
+    print(f"images_array shape: {images_array.shape}")
+
+    labels_array = np.array(labels_dataset)
+    if label_type == 'cls':
+        labels_array = to_categorical(labels_array, num_classes=2)
+
+    print(f"labels_array shape: {labels_array.shape}")
+
+    return images_array, labels_array
 
 def mtcnn_loss(net_type, train_tasks=2, rand_threshold=[0.5]): # need to make sure input type
-    random_int = tf.random_uniform([1])
+    random_int = tf.random.uniform([1])
     
     print_progress = False
     
@@ -172,7 +204,7 @@ def mtcnn_loss(net_type, train_tasks=2, rand_threshold=[0.5]): # need to make su
         random_int = tf.Print(random_int[0], ['random in cls',random_int])
     if train_tasks == 2:
         condition0 = random_int[0] > tf.constant(rand_threshold[0])
-        condition1 = not condition0
+        condition1 = random_int[0] <= tf.constant(rand_threshold[0])
     else:
         condition0 = random_int[0] > tf.constant(rand_threshold[0])
         condition1 = random_int[0] > tf.constant(rand_threshold[1])
@@ -181,6 +213,11 @@ def mtcnn_loss(net_type, train_tasks=2, rand_threshold=[0.5]): # need to make su
         def lossfun(y_true, y_pred):
 
             y_mean_square = backend.mean(backend.square(y_true), axis=-1)
+
+            cls_func = lambda: backend.mean(
+                                      backend.square(y_pred - y_true), 
+                                      axis=-1) 
+            cls_zero = lambda: 0 * y_mean_square
     
             if train_tasks == 2:
                 if print_progress: 
@@ -188,14 +225,10 @@ def mtcnn_loss(net_type, train_tasks=2, rand_threshold=[0.5]): # need to make su
                             'rand int[0]:', random_int[0],
                             ' tf.constant:', tf.constant(rand_threshold[0]),
                             ' condition0:', condition0 ])
-                val= tf.case(
-                        { 
-                            condition0: lambda: backend.mean(
-                                backend.square(y_pred - y_true), 
-                                axis=-1) 
-                        },
-                        default = lambda: 0 * y_mean_square,
-                        exclusive=False )
+
+                val= tf.case([(condition0, cls_func)],
+                              default = cls_zero,
+                              exclusive=False)
 
                 if print_progress: 
                     tf.Print( val, [ 'cls loss out:',val ])
@@ -209,15 +242,10 @@ def mtcnn_loss(net_type, train_tasks=2, rand_threshold=[0.5]): # need to make su
                             'rand int[1]:', random_int[1],
                             ' tf.constant:', tf.constant(rand_threshold[1]),
                             ' condition1:', condition1 ])
-                val= tf.case(
-                        { 
-                            condition1: lambda: backend.mean(
-                                    backend.square(y_pred - y_true), 
-                                    axis=-1),
-                            condition0: lambda: 0 * y_mean_square
-                        },
-                        default = lambda: 0 * y_mean_square,
-                        exclusive=False )
+                val= tf.case([(condition1, cls_func),
+                              (condition0, cls_zero)],
+                             default = cls_zero,
+                             exclusive=False)
                 if print_progress: 
                     tf.Print( val, [ 'cls loss out:',val ]) 
                
@@ -230,6 +258,11 @@ def mtcnn_loss(net_type, train_tasks=2, rand_threshold=[0.5]): # need to make su
             
             y_mean_square = backend.mean(backend.square(y_true), axis=-1)
             
+            bbx_func = lambda: backend.mean(
+                          backend.square(y_pred - y_true), 
+                          axis=-1) 
+            bbx_zero = lambda: 0 * y_mean_square
+            
             if train_tasks == 2:
                 
                 if print_progress: 
@@ -237,14 +270,9 @@ def mtcnn_loss(net_type, train_tasks=2, rand_threshold=[0.5]): # need to make su
                             'rand int[0]:', random_int[0],
                             ' tf.constant:', tf.constant(rand_threshold[0]),
                             ' condition1:', condition1 ])
-                val= tf.case(
-                        { 
-                            condition1: lambda: backend.mean(
-                                backend.square(y_pred - y_true), 
-                                axis=-1) 
-                        },
-                        default = lambda: 0 * y_mean_square,
-                        exclusive=False )
+                val= tf.case([(condition1, bbx_func)],
+                              default = bbx_zero,
+                              exclusive=False)
 
                 if print_progress: 
                     tf.Print( val, [ 'bbx loss out:',val ])
@@ -258,15 +286,10 @@ def mtcnn_loss(net_type, train_tasks=2, rand_threshold=[0.5]): # need to make su
                             'rand int[1]:', random_int[1],
                             ' tf.constant:', tf.constant(rand_threshold[1]),
                             ' condition1:', condition1 ])
-                val= tf.case(
-                        { 
-                            condition1: lambda: 0 * y_mean_square,
-                            condition0: lambda: lambda: backend.mean(
-                                    backend.square(y_pred - y_true), 
-                                    axis=-1),
-                        },
-                        default = lambda: 0 * y_mean_square,
-                        exclusive=False )
+                val= tf.case([(condition1, bbx_zero),
+                              (condition0, bbx_func)],
+                              default = bbx_zero,
+                              exclusive=False)
                 if print_progress: 
                     tf.Print( val, [ 'bbx loss out:', val ]) 
                     
@@ -278,6 +301,11 @@ def mtcnn_loss(net_type, train_tasks=2, rand_threshold=[0.5]): # need to make su
             
             y_mean_square = backend.mean(backend.square(y_true), axis=-1)
  
+            pts_func = lambda: backend.mean(
+                      backend.square(y_pred - y_true), 
+                      axis=-1) 
+            pts_zero = lambda: 0 * y_mean_square
+    
             if print_progress: 
                 tf.Print( condition0, [ 
                         'rand int[0]:', random_int[0],
@@ -287,15 +315,10 @@ def mtcnn_loss(net_type, train_tasks=2, rand_threshold=[0.5]): # need to make su
                         'rand int[1]:', random_int[1],
                         ' tf.constant:', tf.constant(rand_threshold[1]),
                         ' condition1:', condition1 ])
-            val= tf.case(
-                    { 
-                        condition1: lambda: 0 * y_mean_square,
-                        condition0: lambda: 0 * y_mean_square,
-                    },
-                    default = lambda: backend.mean(
-                                backend.square(y_pred - y_true), 
-                                axis=-1),
-                    exclusive=False )
+            val= tf.case([(condition1, pts_zero),
+                          (condition0, pts_zero)],
+                          default = pts_func,
+                          exclusive=False)
                     
             if print_progress: 
                 tf.Print( val, [ 'pts loss out:',val])                
@@ -317,6 +340,9 @@ def train_net(Net, training_data_files, base_lr,
 
     rnd_seed = 49
     np.random.seed(rnd_seed)
+    tf.random.set_seed(rnd_seed)
+    
+    max_data_size = 128
     
     train_images = []
     train_labels = []
@@ -342,7 +368,8 @@ def train_net(Net, training_data_files, base_lr,
             batch_size=batch_size,
             num_epochs=num_epochs,
             label_type=tasks[index],
-            shape=shape_size)
+            shape=shape_size,
+            max_data_size=max_data_size)
         
         X_train, X_test, y_train, y_test = train_test_split(
                 data_images, data_labels,
@@ -351,10 +378,6 @@ def train_net(Net, training_data_files, base_lr,
         
         train_images.append(X_train)
         test_images.append(X_test)
-        
-        if tasks[index] == 'cls':
-            y_train = to_categorical(y_train, num_classes=2)
-            y_test = to_categorical(y_test, num_classes=2)
                 
         train_labels.append(y_train)
         test_labels.append(y_test)
@@ -362,25 +385,56 @@ def train_net(Net, training_data_files, base_lr,
     mtcnn_adam = Adam(lr = base_lr)
 
     mtcnn_net = Net(mode='train', weights_path=save_filename)
-    mtcnn_net.compile(loss=[mtcnn_loss('cls'), mtcnn_loss('bbx')],
-                      optimizer=mtcnn_adam, 
-                      metrics=[accuracy_mean, accuracy_mean])    
+    mtcnn_net_model = mtcnn_net.get_net_model()
+    mtcnn_net_model.compile(loss=[mtcnn_loss('cls'), mtcnn_loss('bbx')],
+                            optimizer=mtcnn_adam, 
+                            metrics=[accuracy_mean, accuracy_mean])    
     
     # Create a callback that saves the model's weights
     cp_callback = ModelCheckpoint(  filepath=save_filename,
                                     save_weights_only=True, 
                                     verbose=1,
                                     save_best_only=True,
-                                    mode='max')
+                                    mode='min')
 
     # Log the epoch detail into csv
-    csv_logger = CSVLogger(save_filename + '.csv')
+    csv_out_path = save_filename + '.csv'
+    csv_logger = CSVLogger(csv_out_path)
     
-    mtcnn_net.fit(train_images, train_labels, 
-                  validation_data=(test_images, test_labels),
-                  batch_size=batch_size, 
-                  epochs=num_epochs, 
-                  callbacks=[cp_callback, csv_logger])
+    mtcnn_net_model.fit(train_images, train_labels, 
+                        validation_data=(test_images, test_labels),
+                        batch_size=batch_size, 
+                        epochs=num_epochs, 
+                        callbacks=[cp_callback, csv_logger])
+
+    plot_training_model(csv_out_path)
+    
+    # Model PDF file
+    model_pdf_file = save_filename + '.pdf'
+    save_training_model(mtcnn_net_model, model_pdf_file)
+
+
+def plot_training_model(training_csv_path):
+    records = pd.read_csv(training_csv_path)
+    plt.figure()
+    plt.plot(records['val_loss'])
+    plt.plot(records['loss'])
+    plt.yticks([0,0.20,0.40,0.60,0.80,1.00])
+    plt.title('Loss value',fontsize=12)
+    
+    ax = plt.gca()
+    ax.set_xticklabels([])
+
+    plt.show()
+
+
+def save_training_model(model, model_pdf_file):
+    plot_model(model, 
+           to_file=model_pdf_file, 
+           show_shapes=True, 
+           show_layer_names=False,
+           rankdir='TB')
+
 
 def train_pnet(training_data_files, base_lr,
                num_epochs, save_filename=None):
