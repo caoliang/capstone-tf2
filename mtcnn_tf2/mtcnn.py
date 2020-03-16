@@ -373,6 +373,14 @@ def train_net(Net, training_data_files, base_lr,
     tf.random.set_seed(rnd_seed)
     
     print(f"max_data_size: {max_data_size}")
+
+    base_dir_name = os.path.dirname(save_filename)
+    if not os.path.exists(base_dir_name):
+        os.makedirs(base_dir_name)
+    print(f"base_dir_name: {base_dir_name}")
+    
+    base_model_name = os.path.splitext(os.path.basename(save_filename))[0]
+    print(f"base_model_name: {base_model_name}")
     
     train_images = []
     train_labels = []
@@ -425,9 +433,8 @@ def train_net(Net, training_data_files, base_lr,
                                     save_best_only=True,
                                     mode='min')
 
-    base_file_name = os.path.splitext(save_filename)[0]
     # Log the epoch detail into csv
-    csv_out_path = base_file_name + '.csv'
+    csv_out_path = os.path.join(base_dir_name, base_model_name + '.csv')
     csv_logger = CSVLogger(csv_out_path)
     
     mtcnn_net_model.fit(train_images, train_labels, 
@@ -438,9 +445,8 @@ def train_net(Net, training_data_files, base_lr,
 
     plot_training_model(csv_out_path)
     
-    # Model PDF file
-    
-    model_pdf_file = base_file_name + '.pdf'
+    # Save model in PDF file
+    model_pdf_file = os.path.join(base_dir_name, base_model_name + '.pdf')
     save_training_model(mtcnn_net_model, model_pdf_file)
 
 
@@ -501,6 +507,6 @@ if __name__ == '__main__':
                num_epochs=3,
                batch_size=64,
                save_filename=model_filename,
-               max_data_size=5000)
+               max_data_size=300)
 
 
