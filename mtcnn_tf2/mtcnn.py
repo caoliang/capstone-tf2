@@ -22,12 +22,14 @@ class NetWork(object):
     def __init__(self, mode='data',  
                  weights_path=None,
                  train_inputs=None,
-                 net_thresholds=None):
+                 net_thresholds=None,
+                 train_rnd=None):
 
         self.mode = mode
         self.weights_path = weights_path
         self.train_inputs = train_inputs
         self.net_thresholds = net_thresholds
+        self.train_rnd = train_rnd
         
         # Network model
         self.net_model = self.setup()
@@ -44,16 +46,21 @@ class NetWork(object):
     def get_net_model(self):
         return self.net_model
 
+    def get_train_rnd(self):
+        return self.train_rnd
+
     def get_train_input(self, net_inputs):
+        if self.train_rnd is None:
+            raise Exception("Training random was not provided")
+        
         thresholds = self.net_thresholds
         
-        random_int = tf.random.uniform([1])
         net_inputs_len = len(net_inputs)
         if net_inputs_len == 2:
             if thresholds is None: 
                 thresholds = [0.5]
             
-            condition0 = random_int[0] > tf.constant(thresholds[0])
+            condition0 = self.train_rnd > tf.constant(thresholds[0])
             
             val = tf.case([(condition0, (lambda: net_inputs[0]))],
                            default=(lambda: net_inputs[1]),
@@ -63,8 +70,8 @@ class NetWork(object):
             if thresholds is None: 
                 thresholds = [0.4, 0.9]
             
-            condition0 = random_int[0] > tf.constant(thresholds[0])
-            condition1 = random_int[0] > tf.constant(thresholds[1])
+            condition0 = self.train_rnd > tf.constant(thresholds[0])
+            condition1 = self.train_rnd > tf.constant(thresholds[1])
             
             val = tf.case([(condition1, lambda: net_inputs[1]),
                            (condition0, lambda: net_inputs[2])],
@@ -74,7 +81,7 @@ class NetWork(object):
             raise Exception(f'Invalid net_inputs size: {len(net_inputs)}')
         
         val.set_shape(net_inputs[0].shape)
-        return [val,random_int]
+        return val
 
 
 class PNet(NetWork):
@@ -85,7 +92,7 @@ class PNet(NetWork):
         else:
             train_inp = [Input(shape = [12, 12, 3]),
                          Input(shape = [12, 12, 3])]
-            (p_inp, random_int) = Lambda(self.get_train_input)(train_inp)
+            p_inp = Lambda(self.get_train_input)(train_inp)
     
         p_layer = Conv2D(10, kernel_size=(3, 3), strides=(1, 1), 
                          padding="valid", name='conv1')(p_inp)
@@ -170,8 +177,10 @@ def get_label_shape(label_type):
 # - Positive number -> limit data length
 def prepare_train_test_inputs(tfrecords_filename, batch_size, 
                          num_epochs, label_type, shape,
-                         max_data_size=10):
+                         max_data_size=10, skip_data_size=0):
     dataset = tf.data.TFRecordDataset(tfrecords_filename)
+    if skip_data_size > 0:
+        dataset = dataset.skip(skip_data_size)
     dataset = dataset.repeat(num_epochs)
     dataset = dataset.shuffle(batch_size * 4)
     
@@ -210,13 +219,7 @@ def prepare_train_test_inputs(tfrecords_filename, batch_size,
 #    label_shape = get_label_shape(label_type)
     train_labels_dataset = np.array(train_labels_dataset)
     test_labels_dataset = np.array(test_labels_dataset)
-    
-#    if label_type == 'cls':
-#        train_labels_dataset = to_categorical(train_labels_dataset, 
-#                                              num_classes=2)
-#        test_labels_dataset = to_categorical(test_labels_dataset, 
-#                                              num_classes=2)
-        
+       
     print(f"train_labels_dataset shape: {train_labels_dataset.shape}")
     print(f"test_labels_dataset shape: {test_labels_dataset.shape}")
 
@@ -224,9 +227,8 @@ def prepare_train_test_inputs(tfrecords_filename, batch_size,
            train_labels_dataset, test_labels_dataset
 
 
-def mtcnn_loss(net_type, train_tasks=2, rand_threshold=[0.5]): # need to make sure input type
-    random_int = tf.random.uniform([1])
-    
+def mtcnn_loss(net_type, random_int, train_tasks=2, 
+               rand_threshold=[0.5]): # need to make sure input type
     print_progress = False
     
     if print_progress: 
@@ -363,17 +365,12 @@ def accuracy_mean(y_pred,y_true):
     return backend.mean(y_true)
 
 
-def train_net(Net, training_data_files, base_lr,
-              num_epochs=1, batch_size=64, 
-              save_filename=None,
-              max_data_size=1280):
-
-    rnd_seed = 49
-    np.random.seed(rnd_seed)
-    tf.random.set_seed(rnd_seed)
+def start_train_net(Net, base_lr, random_int, train_images, train_labels,
+                    test_images, test_labels, num_epochs, batch_size,
+                    save_filename):
     
-    print(f"max_data_size: {max_data_size}")
-
+    mtcnn_adam = Adam(lr = base_lr)
+    
     base_dir_name = os.path.dirname(save_filename)
     if not os.path.exists(base_dir_name):
         os.makedirs(base_dir_name)
@@ -382,47 +379,11 @@ def train_net(Net, training_data_files, base_lr,
     base_model_name = os.path.splitext(os.path.basename(save_filename))[0]
     print(f"base_model_name: {base_model_name}")
     
-    train_images = []
-    train_labels = []
-    test_images = []
-    test_labels = []
-    
-    tasks = ['cls', 'bbx', 'pts']
-    if Net.__name__ == 'PNet':
-        shape_size = 12
-        train_mode = 2
-    elif Net.__name__ == 'RNet':
-        shape_size = 24
-        train_mode = 2
-    elif Net.__name__ == 'ONet':
-        shape_size = 48
-        train_mode = 3
-    else:
-        raise Exception('Invalid training net model')
-    
-    for index in range(train_mode):
-        X_train, X_test, y_train, y_test = prepare_train_test_inputs(
-            tfrecords_filename=training_data_files[index],
-            batch_size=batch_size,
-            num_epochs=num_epochs,
-            label_type=tasks[index],
-            shape=shape_size,
-            max_data_size=max_data_size)
-        
-        print(f"X_train shape: {X_train.shape}, X_test shape: {X_test.shape}")
-        train_images.append(X_train)
-        test_images.append(X_test)
-                
-        print(f"y_train shape: {y_train.shape}, y_test shape: {y_test.shape}")
-        train_labels.append(y_train)
-        test_labels.append(y_test)
-
-        
-    mtcnn_adam = Adam(lr = base_lr)
-
-    mtcnn_net = Net(mode='train', weights_path=save_filename)
+    mtcnn_net = Net(mode='train', weights_path=save_filename,
+                    train_rnd=random_int)
     mtcnn_net_model = mtcnn_net.get_net_model()
-    mtcnn_net_model.compile(loss=[mtcnn_loss('cls'), mtcnn_loss('bbx')],
+    mtcnn_net_model.compile(loss=[mtcnn_loss('cls', random_int), 
+                                  mtcnn_loss('bbx', random_int)],
                             optimizer=mtcnn_adam, 
                             metrics=[accuracy_mean, accuracy_mean])    
     
@@ -449,13 +410,73 @@ def train_net(Net, training_data_files, base_lr,
     model_pdf_file = os.path.join(base_dir_name, base_model_name + '.pdf')
     save_training_model(mtcnn_net_model, model_pdf_file)
 
+def train_net(Net, training_data_files, base_lr,
+              num_epochs=1, batch_size=64, 
+              save_filename=None,
+              max_data_size=1280):
+
+    rnd_seed = 49
+    np.random.seed(rnd_seed)
+    tf.random.set_seed(rnd_seed)
+    
+    tasks = ['cls', 'bbx', 'pts']
+    if Net.__name__ == 'PNet':
+        shape_size = 12
+        train_mode = 2
+    elif Net.__name__ == 'RNet':
+        shape_size = 24
+        train_mode = 2
+    elif Net.__name__ == 'ONet':
+        shape_size = 48
+        train_mode = 3
+    else:
+        raise Exception('Invalid training net model')
+    
+    # Training 6 times with same set of data, so based on randome number
+    # will train cls, bbx, and pts all parts 
+    num_train_loop = 6
+    for training_index in range(num_train_loop):
+        random_int = tf.random.uniform([1])
+        skip_data_size = training_index * max_data_size
+        print(f"skip_data_size: {skip_data_size}, " +
+              f"max_data_size: {max_data_size}")
+
+        train_images = []
+        train_labels = []
+        test_images = []
+        test_labels = []
+            
+        for index in range(train_mode):
+    
+            X_train, X_test, y_train, y_test = prepare_train_test_inputs(
+                tfrecords_filename=training_data_files[index],
+                batch_size=batch_size,
+                num_epochs=1,
+                label_type=tasks[index],
+                shape=shape_size,
+                max_data_size=max_data_size,
+                skip_data_size=skip_data_size)
+            
+            print(f"X_train shape: {X_train.shape}, X_test shape: {X_test.shape}")
+            train_images.append(X_train)
+            test_images.append(X_test)
+                    
+            print(f"y_train shape: {y_train.shape}, y_test shape: {y_test.shape}")
+            train_labels.append(y_train)
+            test_labels.append(y_test)
+            
+        start_train_net(Net, base_lr, random_int, train_images, train_labels,
+                    test_images, test_labels, num_epochs, batch_size,
+                    save_filename)
+    
+
 
 def plot_training_model(training_csv_path):
     records = pd.read_csv(training_csv_path)
     plt.figure()
     plt.plot(records['val_loss'])
     plt.plot(records['loss'])
-    plt.yticks([0,0.20,0.40,0.60,0.80,1.00])
+    plt.yticks([0,0.05,0.10,0.15,0.20,0.30,0.50,1.00])
     plt.title('Loss value',fontsize=12)
     
     ax = plt.gca()
