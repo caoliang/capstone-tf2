@@ -11,6 +11,8 @@ models/pre-train/arc_res50_ccrop/
 mtcnn_tf2/__pycache__/
 data/WIDER_train/
 data/celebA/
+data/CVPR/
+data/mtcnn_training/pnet_12/
 mtcnn_training/__pycache__/
 data/mtcnn_training/native_12/
 data/faces_source/
@@ -23,3 +25,7 @@ data/mtcnn_training/48net/
 align/*.npy
 align_mtcnn/__pycache__/
 align_mtcnn/*.npy
+logs/
+prepare_data/__pycache__/__init__.cpython-37.pyc
+prepare_data/__pycache__/
+data/mtcnn_training/imglists/PNet/

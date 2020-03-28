@@ -8,7 +8,7 @@ from sklearn.model_selection import train_test_split
 
 import tensorflow as tf
 from tensorflow.keras.layers import Conv2D, Input, MaxPool2D, Lambda
-from tensorflow.keras.layers import Reshape, PReLU
+from tensorflow.keras.layers import Reshape, PReLU, Dense
 from tensorflow.keras.models import Model
 from tensorflow.keras import backend
 from tensorflow.keras.optimizers import Adam
@@ -510,6 +510,184 @@ def train_pnet(training_data_files, base_lr,
               batch_size=batch_size,
               save_filename=save_filename,
               max_data_size=max_data_size)
+
+def cls_ohem(cls_prob, label, num_keep_radio = 0.7):
+    zeros = tf.zeros_like(label)
+    #label=-1 --> label=0net_factory
+
+    #pos -> 1, neg -> 0, others -> 0
+    label_filter_invalid = tf.where(tf.less(label,0), zeros, label)
+    num_cls_prob = tf.size(cls_prob)
+    cls_prob_reshape = tf.reshape(cls_prob,[num_cls_prob,-1])
+    label_int = tf.cast(label_filter_invalid,tf.int32)
+    # get the number of rows of class_prob
+    num_row = tf.to_int32(cls_prob.get_shape()[0])
+    #row = [0,2,4.....]
+    row = tf.range(num_row)*2
+    indices_ = row + label_int
+    label_prob = tf.squeeze(tf.gather(cls_prob_reshape, indices_))
+    loss = -tf.log(label_prob+1e-10)
+    zeros = tf.zeros_like(label_prob, dtype=tf.float32)
+    ones = tf.ones_like(label_prob,dtype=tf.float32)
+    # set pos and neg to be 1, rest to be 0
+    valid_inds = tf.where(label < zeros,zeros,ones)
+    # get the number of POS and NEG examples
+    num_valid = tf.reduce_sum(valid_inds)
+
+    keep_num = tf.cast(num_valid*num_keep_radio,dtype=tf.int32)
+    #FILTER OUT PART AND LANDMARK DATA
+    loss = loss * valid_inds
+    loss,_ = tf.nn.top_k(loss, k=keep_num)
+    return tf.reduce_mean(loss)
+
+
+#label=1 or label=-1 then do regression
+def bbox_ohem(bbox_pred, bbox_target, label):
+    '''
+
+    :param bbox_pred:
+    :param bbox_target:
+    :param label: class label
+    :return: mean euclidean loss for all the pos and part examples
+    '''
+    zeros_index = tf.zeros_like(label, dtype=tf.float32)
+    ones_index = tf.ones_like(label,dtype=tf.float32)
+    # keep pos and part examples
+    valid_inds = tf.where(tf.equal(tf.abs(label), 1),ones_index,zeros_index)
+    #(batch,)
+    #calculate square sum
+    square_error = tf.square(bbox_pred-bbox_target)
+    square_error = tf.reduce_sum(square_error,axis=1)
+    #keep_num scalar
+    num_valid = tf.reduce_sum(valid_inds)
+    #keep_num = tf.cast(num_valid*num_keep_radio,dtype=tf.int32)
+    # count the number of pos and part examples
+    keep_num = tf.cast(num_valid, dtype=tf.int32)
+    #keep valid index square_error
+    square_error = square_error*valid_inds
+    # keep top k examples, k equals to the number of positive examples
+    _, k_index = tf.nn.top_k(square_error, k=keep_num)
+    square_error = tf.gather(square_error, k_index)
+
+    return tf.reduce_mean(square_error)
+
+
+def landmark_ohem(landmark_pred, landmark_target,label):
+    '''
+
+    :param landmark_pred:
+    :param landmark_target:
+    :param label:
+    :return: mean euclidean loss
+    '''
+    #keep label =-2  then do landmark detection
+    ones = tf.ones_like(label,dtype=tf.float32)
+    zeros = tf.zeros_like(label,dtype=tf.float32)
+    valid_inds = tf.where(tf.equal(label,-2),ones,zeros)
+    square_error = tf.square(landmark_pred-landmark_target)
+    square_error = tf.reduce_sum(square_error,axis=1)
+    num_valid = tf.reduce_sum(valid_inds)
+    #keep_num = tf.cast(num_valid*num_keep_radio,dtype=tf.int32)
+    keep_num = tf.cast(num_valid, dtype=tf.int32)
+    square_error = square_error*valid_inds
+    _, k_index = tf.nn.top_k(square_error, k=keep_num)
+    square_error = tf.gather(square_error, k_index)
+
+    return tf.reduce_mean(square_error)
+
+
+def cal_accuracy(cls_preb, label):
+    '''
+
+    :param cls_prob:
+    :param label:
+    :return:calculate classification accuracy for pos and neg examples only
+    '''
+    # get the index of maximum value along axis one from cls_prob
+    # 0 for negative 1 for positive
+    pred = tf.argmax(cls_preb, axis=1)
+    label_int = tf.cast(label,tf.int64)
+    # return the index of pos and neg examples
+    cond = tf.where(tf.greater_equal(label_int,0))
+    picked = tf.squeeze(cond)
+    # gather the label of pos and neg examples
+    label_picked = tf.gather(label_int,picked)
+    pred_picked = tf.gather(pred,picked)
+    #calculate the mean value of a vector contains 1 and 0, 1 for correct classification, 0 for incorrect
+    # ACC = (TP+FP)/total population
+    accuracy_op = tf.reduce_mean(tf.cast(tf.equal(label_picked,pred_picked),tf.float32))
+    return accuracy_op
+
+
+def create_pnet(net_input=None, net_label=None, bbox_target=None, 
+                landmark_target=None, weight_path = None, 
+                train = False, l2_regu=0.0005):
+    net_input = Input(shape=[None, None, 3])
+    x = Conv2D(10, (3, 3), strides=1, padding='valid', 
+               kernel_regularizer=tf.keras.regularizers.l2(l2_regu),
+               name='conv1')(input)
+    x = PReLU(shared_axes=[1,2], 
+              alpha_initializer=tf.constant_initializer(0.25), 
+              alpha_regularizer=tf.keras.regularizers.l2(l2_regu), 
+              name='PReLU1')(x)
+    x = MaxPool2D(pool_size=2)(x)
+    x = Conv2D(16, (3, 3), strides=1, padding='valid', 
+               kernel_regularizer=tf.keras.regularizers.l2(l2_regu),
+               name='conv2')(x)
+    x = PReLU(shared_axes=[1,2], 
+              alpha_initializer=tf.constant_initializer(0.25), 
+              alpha_regularizer=tf.keras.regularizers.l2(l2_regu), 
+              name='PReLU2')(x)
+    x = Conv2D(32, (3, 3), strides=1, padding='valid', 
+               kernel_regularizer=tf.keras.regularizers.l2(l2_regu),
+               name='conv3')(x)
+    x = PReLU(shared_axes=[1,2], 
+              alpha_initializer=tf.constant_initializer(0.25), 
+              alpha_regularizer=tf.keras.regularizers.l2(l2_regu), 
+              name='PReLU3')(x)
+    cls_pred = Conv2D(2, (1, 1), activation='softmax', 
+                      kernel_regularizer=tf.keras.regularizers.l2(l2_regu),
+                      name='conv4_1')(x)
+    bbox_pred = Conv2D(4, (1, 1), 
+                      kernel_regularizer=tf.keras.regularizers.l2(l2_regu),
+                      name='conv4_2')(x)
+    lmk_pred = Conv2D(10, (1, 1), 
+                      kernel_regularizer=tf.keras.regularizers.l2(l2_regu),
+                      name='conv4_3')(x)
+    
+    if train:
+        #batch * 2
+        # calculate classification loss
+        cls_preb = tf.squeeze(cls_pred, [1,2], name='cls_prob')
+        cls_loss = cls_ohem(cls_preb, net_label)
+        #batch
+        # cal bounding box error, squared sum error
+        bbox_pred = tf.squeeze(bbox_pred, [1,2], name='bbox_pred')
+        bbox_loss = bbox_ohem(bbox_pred, bbox_target, net_label)
+        #batch*10
+        lmk_pred = tf.squeeze(lmk_pred, [1,2], name="lmk_pred")
+        lmk_loss = landmark_ohem(lmk_pred, landmark_target, net_label)
+
+        model = Model([net_input], [cls_pred, bbox_pred, lmk_pred])
+        if not weight_path is None:
+            model.load_weights(weight_path, by_name=True)
+
+        accuracy = cal_accuracy(cls_preb, net_label)
+        l2_loss = tf.math.add_n(model.losses)
+        
+        return model, cls_loss, bbox_loss, lmk_loss, l2_loss, accuracy
+
+    else:
+        cls_pro_test = tf.squeeze(cls_pred, axis=0)
+        bbox_pred_test = tf.squeeze(bbox_pred, axis=0)
+        lmk_pred_test = tf.squeeze(lmk_pred, axis=0)
+        
+        model = Model([net_input], 
+                      [cls_pro_test, bbox_pred_test, lmk_pred_test])
+        if not weight_path is None:
+            model.load_weights(weight_path, by_name=True)
+        
+        return model
 
 
 if __name__ == '__main__':

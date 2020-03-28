@@ -1,0 +1,44 @@
+# general
+
+# train
+
+# prepare_data\gen_12net_data.py
+pnet_anno_file: "../data/WIDER_train/wider_face_train.txt"
+pnet_im_dir: "../data/WIDER_train/images"
+pnet_pos_save_dir: "../data/mtcnn_training/pnet_12/positive"
+pnet_part_save_dir: "../data/mtcnn_training/pnet_12/part"
+pnet_neg_save_dir: "../data/mtcnn_training/pnet_12/negative"
+pnet_save_dir: "../data/mtcnn_training/pnet_12"
+
+# prepare_data\gen_landmark_aug_12.py
+pnet_landmark_outdir: "../data/mtcnn_training/pnet_12"
+pnet_landmark_dstdir: "../data/mtcnn_training/pnet_12/train_PNet_landmark"
+pnet_data_path: "../data/celebA/Img/img_celeba"
+pnet_landmark_img_list: "../data/celebA/Anno/train_imglist_align.txt"
+
+# prepare_data\gen_imglist_pnet.py
+# prepare_data\gen_PNet_tfrecords.py
+training_data_dir: "../data/mtcnn_training"
+
+# mtcnn_training\train_pnet.py
+pnet_train_dataset: "../data/mtcnn_training/imglists/PNet/train_PNet_landmark_shuffle.tfrecord"
+num_samples: 1500000
+batch_size: 384
+# learning rate
+base_lr: !!float 1e-4
+
+embd_shape: 512
+is_ccrop: False # central-cropping or not
+binary_img: True
+num_classes: 85742
+num_samples: 5822653
+epochs: 5
+w_decay: !!float 5e-4
+save_steps: 1000
+eager_fit: False
+
+# test
+test_dataset: './data/faces_test'
+
+# saved model
+ckpt_path: './models/arc_res50.ckpt'
