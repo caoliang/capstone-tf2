@@ -68,3 +68,43 @@ def load_fake_dataset(size):
     y_train = tf.expand_dims(y_train, axis=0)
 
     return tf.data.Dataset.from_tensor_slices((x_train, y_train))
+
+def read_single_tfrecord(net):
+    def parse_tfrecord(tfrecord):
+        features={
+            'image/encoded': tf.FixedLenFeature([], tf.string),#one image  one record
+            'image/label': tf.FixedLenFeature([], tf.int64),
+            'image/roi': tf.FixedLenFeature([4], tf.float32),
+            'image/landmark': tf.FixedLenFeature([10],tf.float32)
+        }
+        
+        parsed_tfrecord = tf.io.parse_single_example(tfrecord, features)
+        if net == 'PNet':
+            image_size = 12
+        elif net == 'RNet':
+            image_size = 24
+        elif net == "ONet":
+            image_size = 48
+        else:
+            raise Exception(f"Invalid net name: {net}")
+    
+        image = tf.decode_raw(parsed_tfrecord['image/encoded'], tf.uint8)
+        image = tf.reshape(image, [image_size, image_size, 3])
+        image = (tf.cast(image, tf.float32)-127.5) / 128
+        
+        # image = tf.image.per_image_standardization(image)
+        label = tf.cast(parsed_tfrecord['image/label'], tf.float32)
+        roi = tf.cast(parsed_tfrecord['image/roi'],tf.float32)
+        landmark = tf.cast(parsed_tfrecord['image/landmark'],tf.float32)
+        
+        return image, label, roi, landmark
+
+    return parse_tfrecord
+
+def load_train_dataset(tfrecords_filename, batch_size, net_name):
+    dataset = tf.data.TFRecordDataset(tfrecords_filename)
+    dataset = dataset.shuffle().batch(batch_size, drop_remainder=True)
+    
+    image, label, roi, landmark = dataset.map(read_single_tfrecord(net_name))
+        
+    return image, label, roi, landmark

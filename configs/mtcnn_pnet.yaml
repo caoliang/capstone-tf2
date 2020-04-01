@@ -22,6 +22,7 @@ training_data_dir: "../data/mtcnn_training"
 
 # mtcnn_training\train_pnet.py
 pnet_train_dataset: "../data/mtcnn_training/imglists/PNet/train_PNet_landmark_shuffle.tfrecord"
+pnet_train_outdir: "../data/mtcnn_training/saved_model/PNet"
 num_samples: 1500000
 batch_size: 384
 # learning rate

@@ -18,6 +18,8 @@ from modules.utils import set_memory_growth, get_ckpt_inf
 import modules.dataset as dataset
 
 from modules.utils import load_yaml
+from mtcnn_tf2.mtcnn import create_pnet
+
 
 flags.DEFINE_string('train_cfg_path', '../configs/mtcnn_pnet.yaml', 
                     'MTCNN pnet configuration file path')
@@ -40,26 +42,26 @@ def main(_):
     alog.info(f'GPUs: {gpus}')
 
     train_dataset = cfg['pnet_train_dataset']
+    train_out = cfg['pnet_train_out']
 
-    alog.info("load pnet tfrecord dataset.")
     dataset_size = cfg['num_samples']
     batch_size = cfg['batch_size']
-    net_name = 'Net'
+    net_name = 'PNet'
     base_lr = cfg['base_lr']
-    train()
+    train(net_name, train_dataset, dataset_size, batch_size,
+          train_out, base_lr)
 
 
-
-def train(net_factory, net, dataset_size, batch_size, 
-          dataset_path, base_lr=0.01):
+def train(net_name, dataset_path, dataset_size, batch_size, 
+          train_out_dir, base_lr=0.01):
     """
     train PNet/RNet/ONet
-    :param net_factory:
-    :param prefix: model path
-    :param end_epoch:
-    :param dataset:
-    :param display:
-    :param base_lr:
+    :param net_name: PNet/RNet/ONet
+    :param dataset_path: dataset tfrecord file path
+    :param dataset_size: total number of tfrecords
+    :param batch_size: training batch size
+    :param train_out_dir: training results output directory
+    :param base_lr: Base learning rate
     :return:
     """
 
@@ -67,59 +69,23 @@ def train(net_factory, net, dataset_size, batch_size,
     alog.info(f"dataset_size: {dataset_size}, batch_size: {batch_size}, "
               + f"steps_per_epoch: {steps_per_epoch}")
     
-    train_dataset = dataset.load_tfrecord_dataset(
-        cfg['train_dataset'], cfg['batch_size'], cfg['binary_img'],
-        is_ccrop=cfg['is_ccrop'])
+    image, label, roi, landmark = dataset.load_train_dataset(dataset_path, 
+                                                             batch_size, 
+                                                             net_name)
+    alog.info("loaded tfrecord training dataset")
 
-    
-    #label file
-    label_file = os.path.join(base_dir,'train_%s_landmark.txt' % net)
-    #label_file = os.path.join(base_dir,'landmark_12_few.txt')
-    print(label_file)
-    f = open(label_file, 'r')
-    # get number of training examples
-    num = len(f.readlines())
-    print("Total size of the dataset is: ", num)
-    print(prefix)
-
-    #PNet use this method to get data
-    if net == 'PNet':
-        #dataset_dir = os.path.join(base_dir,'train_%s_ALL.tfrecord_shuffle' % net)
-        dataset_dir = os.path.join(base_dir,'train_%s_landmark.tfrecord_shuffle' % net)
-        print('dataset dir is:',dataset_dir)
-        image_batch, label_batch, bbox_batch,landmark_batch = read_single_tfrecord(dataset_dir, config.BATCH_SIZE, net)
-        
-    #RNet use 3 tfrecords to get data    
-    else:
-        pos_dir = os.path.join(base_dir,'pos_landmark.tfrecord_shuffle')
-        part_dir = os.path.join(base_dir,'part_landmark.tfrecord_shuffle')
-        neg_dir = os.path.join(base_dir,'neg_landmark.tfrecord_shuffle')
-        #landmark_dir = os.path.join(base_dir,'landmark_landmark.tfrecord_shuffle')
-        landmark_dir = os.path.join('../../DATA/imglists/RNet','landmark_landmark.tfrecord_shuffle')
-        dataset_dirs = [pos_dir,part_dir,neg_dir,landmark_dir]
-        pos_radio = 1.0/6;part_radio = 1.0/6;landmark_radio=1.0/6;neg_radio=3.0/6
-        pos_batch_size = int(np.ceil(config.BATCH_SIZE*pos_radio))
-        assert pos_batch_size != 0,"Batch Size Error "
-        part_batch_size = int(np.ceil(config.BATCH_SIZE*part_radio))
-        assert part_batch_size != 0,"Batch Size Error "
-        neg_batch_size = int(np.ceil(config.BATCH_SIZE*neg_radio))
-        assert neg_batch_size != 0,"Batch Size Error "
-        landmark_batch_size = int(np.ceil(config.BATCH_SIZE*landmark_radio))
-        assert landmark_batch_size != 0,"Batch Size Error "
-        batch_sizes = [pos_batch_size,part_batch_size,neg_batch_size,landmark_batch_size]
-        #print('batch_size is:', batch_sizes)
-        image_batch, label_batch, bbox_batch,landmark_batch = read_multi_tfrecords(dataset_dirs,batch_sizes, net)        
-        
     #landmark_dir    
-    if net == 'PNet':
+    if net_name == 'PNet':
         image_size = 12
         radio_cls_loss = 1.0;radio_bbox_loss = 0.5;radio_landmark_loss = 0.5;
-    elif net == 'RNet':
+    elif net_name == 'RNet':
         image_size = 24
         radio_cls_loss = 1.0;radio_bbox_loss = 0.5;radio_landmark_loss = 0.5;
-    else:
+    elif net_name == 'ONet':
         radio_cls_loss = 1.0;radio_bbox_loss = 0.5;radio_landmark_loss = 1;
         image_size = 48
+    else:
+        raise Exception(f"Invalid net name: {net_name}")
     
     #define placeholder
     input_image = tf.placeholder(tf.float32, shape=[config.BATCH_SIZE, image_size, image_size, 3], name='input_image')
@@ -128,7 +94,7 @@ def train(net_factory, net, dataset_size, batch_size,
     landmark_target = tf.placeholder(tf.float32,shape=[config.BATCH_SIZE,10],name='landmark_target')
     #get loss and accuracy
     input_image = image_color_distort(input_image)
-    cls_loss_op,bbox_loss_op,landmark_loss_op,L2_loss_op,accuracy_op = net_factory(input_image, label, bbox_target,landmark_target,training=True)
+    cls_loss_op, bbox_loss_op, landmark_loss_op, L2_loss_op, accuracy_op = create_pnet(input_image, label, bbox_target,landmark_target,training=True)
     #train,update learning rate(3 loss)
     total_loss_op  = radio_cls_loss*cls_loss_op + radio_bbox_loss*bbox_loss_op + radio_landmark_loss*landmark_loss_op + L2_loss_op
     train_op, lr_op = train_model(base_lr,
